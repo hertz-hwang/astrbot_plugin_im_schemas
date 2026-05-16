@@ -6,14 +6,17 @@ from typing import Optional
 
 import aiohttp
 try:
-    from fonttools.ttLib import TTCollection, TTFont
+    from fontTools.ttLib import TTCollection, TTFont
 except ImportError:
     import importlib
     import subprocess
     import sys
     subprocess.check_call([sys.executable, "-m", "pip", "install", "fonttools>=4.0.0"])
     importlib.invalidate_caches()
-    from fonttools.ttLib import TTCollection, TTFont
+    for key in list(sys.modules.keys()):
+        if "fonttools" in key.lower() or "fontTools" in key:
+            del sys.modules[key]
+    from fontTools.ttLib import TTCollection, TTFont
 from PIL import Image, ImageDraw, ImageFont
 
 from astrbot.api import logger
