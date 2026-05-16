@@ -8,8 +8,11 @@ import aiohttp
 try:
     from fonttools.ttLib import TTCollection, TTFont
 except ImportError:
-    import subprocess, sys
+    import importlib
+    import subprocess
+    import sys
     subprocess.check_call([sys.executable, "-m", "pip", "install", "fonttools>=4.0.0"])
+    importlib.invalidate_caches()
     from fonttools.ttLib import TTCollection, TTFont
 from PIL import Image, ImageDraw, ImageFont
 
