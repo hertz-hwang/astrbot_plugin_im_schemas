@@ -1,0 +1,11 @@
+name: astrbot_plugin_im_schemas
+display_name: 输入法码表查询
+desc: 支持用户上传自定义码表，查询汉字/词语的输入法编码
+help: |
+  私聊发送码表文件（.txt/.dict）即可导入。
+  /查码 <字词>  — 查询编码
+  /码表信息     — 查看当前码表统计
+  /删除码表     — 删除当前码表
+version: v1.0.0
+author: hertz
+repo: ""
