@@ -1,12 +1,19 @@
 import re
 import sqlite3
+import subprocess
+import sys
 from io import BytesIO
 from pathlib import Path
 from typing import Optional
 
 import aiohttp
-from fonttools.ttLib import TTCollection, TTFont
 from PIL import Image, ImageDraw, ImageFont
+
+try:
+    from fonttools.ttLib import TTCollection, TTFont
+except ImportError:
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "fonttools>=4.0.0"])
+    from fonttools.ttLib import TTCollection, TTFont
 
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, filter
