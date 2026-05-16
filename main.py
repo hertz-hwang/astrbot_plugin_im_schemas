@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Optional
 
 import aiohttp
+from fonttools.ttLib import TTCollection, TTFont
 from PIL import Image, ImageDraw, ImageFont
 
 from astrbot.api import logger
@@ -17,29 +18,79 @@ DATA_DIR.mkdir(exist_ok=True)
 
 DB_PATH = DATA_DIR / "schemas.db"
 
-_FONT_CANDIDATES = [
-    "/System/Library/Fonts/PingFang.ttc",
-    "/System/Library/Fonts/STHeiti Light.ttc",
-    "/Library/Fonts/Arial Unicode MS.ttf",
-    "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
-    "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
-    "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
-    "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
-    "/usr/share/fonts/wqy-microhei/wqy-microhei.ttc",
-    "C:/Windows/Fonts/msyh.ttc",
-    "C:/Windows/Fonts/simsun.ttc",
+FONTS_DIR = Path(__file__).parent / "fonts"
+
+# 字体加载顺序：ChaiPUA → SourceHanSansSC → Plangothic，按优先级尝试
+_BUNDLED_FONTS = [
+    FONTS_DIR / "ChaiPUA-0.2.7.ttf",
+    FONTS_DIR / "SourceHanSansSC-Regular.otf",
+    FONTS_DIR / "Plangothic.ttc",
 ]
+
+
+def _build_cmap(font_path: Path) -> frozenset[int]:
+    """读取字体文件的 cmap，返回其覆盖的 Unicode 码位集合。"""
+    codepoints: set[int] = set()
+    try:
+        suffix = font_path.suffix.lower()
+        if suffix == ".ttc":
+            col = TTCollection(str(font_path))
+            for tt in col.fonts:
+                cmap = tt.getBestCmap()
+                if cmap:
+                    codepoints.update(cmap.keys())
+        else:
+            tt = TTFont(str(font_path))
+            cmap = tt.getBestCmap()
+            if cmap:
+                codepoints.update(cmap.keys())
+    except Exception as e:
+        logger.warning(f"[im_schemas] 读取字体 cmap 失败 {font_path.name}: {e}")
+    return frozenset(codepoints)
+
+
+# 模块级预加载：(cmap码位集, 字体路径) 列表，启动时构建一次
+_FONT_CMAPS: list[tuple[frozenset[int], Path]] = [
+    (_build_cmap(p), p)
+    for p in _BUNDLED_FONTS
+    if p.exists()
+]
+
+
+def _load_fonts(size: int) -> list[ImageFont.FreeTypeFont]:
+    """按优先级加载所有可用字体，返回 Pillow 字体列表。"""
+    fonts = []
+    for _, p in _FONT_CMAPS:
+        try:
+            fonts.append(ImageFont.truetype(str(p), size))
+        except Exception:
+            pass
+    if not fonts:
+        fonts.append(ImageFont.load_default())
+    return fonts
+
+
+def _pick_font(ch: str, fonts: list) -> ImageFont.FreeTypeFont:
+    """用 cmap 精确判断哪个字体有该字符的字形，找不到则用第一个字体。"""
+    cp = ord(ch)
+    for (cmap, _), f in zip(_FONT_CMAPS, fonts):
+        if cp in cmap:
+            return f
+    return fonts[0]
+
+
+def _render_text_with_fallback(draw, pos, text: str, fonts: list, fill):
+    """逐字符渲染，通过 cmap 为每个字符选用正确的字体。"""
+    x, y = pos
+    for ch in text:
+        f = _pick_font(ch, fonts)
+        draw.text((x, y), ch, font=f, fill=fill)
+        bb = draw.textbbox((0, 0), ch, font=f)
+        x += bb[2] - bb[0]
+
 
 DEFAULT_SELECT_KEYS = "_;'4567890"
 DEFAULT_MAX_LEN = 4
-
-
-def _find_font() -> Optional[str]:
-    import os
-    for p in _FONT_CANDIDATES:
-        if os.path.exists(p):
-            return p
-    return None
 
 
 def _open_db() -> sqlite3.Connection:
@@ -69,12 +120,6 @@ def _open_db() -> sqlite3.Connection:
 class IMSchemasPlugin(Star):
     def __init__(self, context: Context):
         super().__init__(context)
-        self.font_path = _find_font()
-        if not self.font_path:
-            logger.warning(
-                "[im_schemas] 未找到 CJK 字体，图片中文字可能显示为方块。"
-                "请安装 wqy-microhei 或 noto-cjk 字体。"
-            )
 
     # ── 数据库操作 ──────────────────────────────────────────────────────────
 
@@ -238,57 +283,65 @@ class IMSchemasPlugin(Star):
         img = Image.new("RGB", (IMG_W, IMG_H), C_BG)
         draw = ImageDraw.Draw(img)
 
-        def font(size: int):
-            if self.font_path:
-                try:
-                    return ImageFont.truetype(self.font_path, size)
-                except Exception:
-                    pass
-            return ImageFont.load_default()
+        fonts_hdr  = _load_fonts(18)
+        fonts_word = _load_fonts(34)
+        fonts_th   = _load_fonts(15)
+        fonts_row  = _load_fonts(16)
 
-        f_hdr  = font(18)
-        f_word = font(34)
-        f_th   = font(15)
-        f_row  = font(16)
+        def wh(text: str, fonts) -> tuple[int, int]:
+            total_w = 0
+            max_h = 0
+            for ch in text:
+                f = fonts[0]
+                for ff in fonts:
+                    try:
+                        bb = draw.textbbox((0, 0), ch, font=ff)
+                        if bb[2] > bb[0]:
+                            f = ff
+                            break
+                    except Exception:
+                        pass
+                bb = draw.textbbox((0, 0), ch, font=f)
+                total_w += bb[2] - bb[0]
+                max_h = max(max_h, bb[3] - bb[1])
+            return total_w, max_h
 
-        def wh(text: str, f) -> tuple[int, int]:
-            bb = draw.textbbox((0, 0), text, font=f)
-            return bb[2] - bb[0], bb[3] - bb[1]
-
-        def center(text: str, f, x: int, y: int, w: int, h: int, color):
-            tw, th = wh(text, f)
-            draw.text((x + (w - tw) / 2, y + (h - th) / 2), text, font=f, fill=color)
+        def center(text: str, fonts, x: int, y: int, w: int, h: int, color):
+            tw, th = wh(text, fonts)
+            _render_text_with_fallback(draw, (x + (w - tw) / 2, y + (h - th) / 2), text, fonts, color)
 
         # 标题栏
         draw.rectangle([(0, 0), (IMG_W, HEADER_H)], fill=C_HDR_BG)
-        center(f"词提：{schema_name}", f_hdr, 0, 0, IMG_W, HEADER_H, C_HDR_FG)
+        center(f"词提：{schema_name}", fonts_hdr, 0, 0, IMG_W, HEADER_H, C_HDR_FG)
 
         # 字词行
         label = f"字词：{word}"
-        _, th = wh(label, f_word)
-        draw.text((PAD, HEADER_H + (WORD_H - th) / 2), label, font=f_word, fill=C_WORD_FG)
+        _, th = wh(label, fonts_word)
+        _render_text_with_fallback(draw, (PAD, HEADER_H + (WORD_H - th) / 2), label, fonts_word, C_WORD_FG)
 
         ty = HEADER_H + WORD_H
         tx = PAD
 
         # 表头
         draw.rectangle([(tx, ty), (tx + TABLE_W, ty + ROW_H)], fill=C_TH_BG)
-        center("#",   f_th, tx,          ty, IDX_W,  ROW_H, C_TH_FG)
-        center("编码", f_th, tx + IDX_W, ty, CODE_W, ROW_H, C_TH_FG)
+        center("#",   fonts_th, tx,          ty, IDX_W,  ROW_H, C_TH_FG)
+        center("编码", fonts_th, tx + IDX_W, ty, CODE_W, ROW_H, C_TH_FG)
         draw.line([(tx, ty + ROW_H), (tx + TABLE_W, ty + ROW_H)], fill=C_BORDER, width=1)
         ty += ROW_H
 
         if not codes:
             draw.rectangle([(tx, ty), (tx + TABLE_W, ty + ROW_H)], fill=C_ODD)
-            draw.text((tx + 12, ty + (ROW_H - 16) / 2), "无结果", font=f_row, fill=C_EMPTY)
+            _render_text_with_fallback(draw, (tx + 12, ty + (ROW_H - 16) / 2), "无结果", fonts_row, C_EMPTY)
         else:
             for i, code in enumerate(codes):
                 bg = C_ODD if i % 2 == 0 else C_EVEN
                 draw.rectangle([(tx, ty), (tx + TABLE_W, ty + ROW_H)], fill=bg)
-                center(str(i + 1), f_row, tx,          ty, IDX_W,  ROW_H, C_ROW_FG)
-                draw.text(
-                    (tx + IDX_W + 12, ty + (ROW_H - 16) / 2),
-                    code, font=f_row, fill=C_ROW_FG,
+                center(str(i + 1), fonts_row, tx,          ty, IDX_W,  ROW_H, C_ROW_FG)
+                _, ch_h = wh(code, fonts_row)
+                _render_text_with_fallback(
+                    draw,
+                    (tx + IDX_W + 12, ty + (ROW_H - ch_h) / 2),
+                    code, fonts_row, C_ROW_FG,
                 )
                 draw.line(
                     [(tx, ty + ROW_H), (tx + TABLE_W, ty + ROW_H)],
