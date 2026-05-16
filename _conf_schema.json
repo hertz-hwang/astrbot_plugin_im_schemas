@@ -1,0 +1,26 @@
+{
+  "all_schemas": {
+    "description": "all 组方案列表",
+    "hint": "用 all <字词> 查询时，会按此列表中的方案逐个生成打法。请填入已上传的词提名，每行一个。",
+    "type": "list",
+    "default": []
+  },
+  "all_trigger": {
+    "description": "all 组触发词",
+    "hint": "用于触发 all 组查询的命令名。例如默认 all，输入 all 中国 会按 all_schemas 列表中的所有方案查询。支持正则匹配（如 all|All|ALL 可同时支持多种写法），留空则禁用 all 组功能。",
+    "type": "string",
+    "default": "all"
+  },
+  "single_char_prefix": {
+    "description": "强制单字查询引导键",
+    "hint": "在 [词提名] 前加此引导键可强制按单字逐一查询，跳过词组组合。例如默认 !，输入 !五笔86 中国人 会按单字打法生成（不会合并出 中国 这种词组）。支持正则匹配，留空则禁用。",
+    "type": "string",
+    "default": "!"
+  },
+  "member_max_schemas": {
+    "description": "成员可上传词提数量上限",
+    "hint": "非管理员用户可上传的词提码表数量上限。达到上限后需先删除已有词提才能上传新的。AstrBot 管理员不受此限制。设为 0 或负数表示不限制。",
+    "type": "int",
+    "default": 3
+  }
+}
