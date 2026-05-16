@@ -7,17 +7,10 @@ from typing import Optional
 import aiohttp
 from PIL import Image, ImageDraw, ImageFont
 
-from astrbot.api.event import filter
-from astrbot.api.star import Context, Star, register
-from astrbot.core import logger
-from astrbot.core.message.components import (
-    ComponentType,
-    File,
-    Image as AstrImage,
-    Reply,
-)
-from astrbot.core.platform import AstrMessageEvent
-from astrbot.core.star.filter.event_message_type import EventMessageType
+from astrbot.api import logger
+from astrbot.api.event import AstrMessageEvent, filter
+from astrbot.api.message_components import ComponentType, File, Image as AstrImage, Reply
+from astrbot.api.star import Context, Star
 
 DATA_DIR = Path(__file__).parent / "data"
 DATA_DIR.mkdir(exist_ok=True)
@@ -73,7 +66,6 @@ def _open_db() -> sqlite3.Connection:
     return conn
 
 
-@register("im_schemas", "hertz", "输入法码表查询", "1.0.0")
 class IMSchemasPlugin(Star):
     def __init__(self, context: Context):
         super().__init__(context)
@@ -318,7 +310,7 @@ class IMSchemasPlugin(Star):
 
     # ── 私聊：暂存文件，等待 "上传词提" 指令 ──────────────────────────────
 
-    @filter.event_message_type(EventMessageType.FRIEND_MESSAGE)
+    @filter.event_message_type(filter.EventMessageType.FRIEND_MESSAGE)
     async def handle_private_file(self, event: AstrMessageEvent):
         """私聊收到文件时，暂存供后续 '上传词提' 指令使用。"""
         chain = event.get_messages()

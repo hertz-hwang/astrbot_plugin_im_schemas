@@ -2,10 +2,10 @@ name: astrbot_plugin_im_schemas
 display_name: 输入法码表查询
 desc: 支持用户上传自定义码表，查询汉字/词语的输入法编码
 help: |
-  私聊发送码表文件（.txt/.dict）即可导入。
-  /查码 <字词>  — 查询编码
-  /码表信息     — 查看当前码表统计
-  /删除码表     — 删除当前码表
+  私聊发送 .txt 文件 → 引用回复该消息发送 上传词提 [词提名] 选重键=_;' 最大长度=4
+  [词提名] <字词>  — 查询编码
+  %[词提名]     — 查看当前码表统计
+  删除词提 [词提名]     — 删除当前码表（仅上传者）
 version: v1.0.0
 author: hertz
-repo: ""
+repo: "https://github.com/hertz-hwang/astrbot_plugin_im_schemas"
