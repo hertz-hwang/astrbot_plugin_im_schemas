@@ -196,19 +196,63 @@ def _select_symbol(pos: int, select_keys: str) -> str:
     return "?"
 
 
+def _explicit_select_pos(code: str, select_keys: str) -> Optional[int]:
+    """若 code 末位是 select_keys[1:] 中的字符，返回该选重位序（≥2），否则 None。
+    select_keys[0] 是首选键（如空格 / `_`），不算选重。"""
+    if not code or len(select_keys) < 2:
+        return None
+    idx = select_keys.find(code[-1])
+    return idx + 1 if idx >= 1 else None
+
+
+def _pure_code_len(code: str, select_keys: str) -> int:
+    """编码的"纯长度"：末位若是任何 select_keys 字符（首选键或选重键）则扣除。
+    用于按编码长度上色：y_ → 1，nim; → 3，nim → 3，aaaa → 4。"""
+    if code and select_keys and code[-1] in select_keys:
+        return len(code) - 1
+    return len(code)
+
+
 def _code_display(code: str, max_len: int, pos: int = 1, select_keys: str = "") -> str:
     if pos > 1:
-        return code + _select_symbol(pos, select_keys)
+        sym = _select_symbol(pos, select_keys)
+        # code 已显式带选重键时不再重复拼接
+        if code.endswith(sym):
+            return code
+        return code + sym
     if len(code) < max_len:
         first_key = select_keys[0] if select_keys else "_"
         return code + first_key
     return code
 
 
-def _key_presses(code: str, max_len: int, pos: int = 1) -> int:
+def _key_presses(code: str, max_len: int, pos: int = 1, select_keys: str = "") -> int:
     if pos > 1:
+        sym = _select_symbol(pos, select_keys)
+        # code 已显式带选重键时不再多算一键
+        if code.endswith(sym):
+            return len(code)
         return len(code) + 1
     return len(code) + (1 if len(code) < max_len else 0)
+
+
+def _omit_in_punct_context(
+    code: str,
+    pos: int,
+    max_len: int,
+    select_keys: str,
+) -> Optional[tuple[int, str]]:
+    """段后是自编码标点时的省略规则；可省略时返回 (按键数, 显示码串)，否则 None。
+
+    - 首选键省略：pos==1 且 len(code)<max_len，省末位首选键（补齐到 max_len 的尾键不必敲）。
+    - 末位 select_keys 省略：max_len<=0 且码表中条目末位本就是 select_keys 中的字符
+      （含首选键 / 选重键），省末位（max_len<=0 表示作者声明不限码长，标点本身就是上屏触发）。
+    """
+    if pos == 1 and len(code) < max_len:
+        return len(code), code
+    if max_len <= 0 and code and select_keys and code[-1] in select_keys:
+        return len(code) - 1, code[:-1]
+    return None
 
 
 def _load_pair_equivalence() -> dict[str, float]:
@@ -515,6 +559,12 @@ class IMSchemasPlugin(Star):
                 candidates.add(word[i:j])
 
         codes = self._query_word_codes(schema_name, list(candidates))
+        # 码表里若直接收录了末位为选重键的条目（如 aa;），用末位键覆盖 pos，
+        # 让后续渲染/统计自然把它当作选重处理。
+        codes = {
+            w: ((code, _explicit_select_pos(code, select_keys) or pos))
+            for w, (code, pos) in codes.items()
+        }
 
         INF = float("inf")
         # dp[i] = 处理前 i 个字符的最少按键数；choice[i] = (start, segment) 用于回溯
@@ -536,7 +586,7 @@ class IMSchemasPlugin(Star):
                     text=ch, code=code, pos=pos,
                     is_self_coded=False, is_missing=False,
                 )
-                cost = dp[i] + _key_presses(code, max_len, pos)
+                cost = dp[i] + _key_presses(code, max_len, pos, select_keys)
                 if cost < dp[i + 1]:
                     dp[i + 1] = cost
                     choice[i + 1] = (i, seg)
@@ -573,7 +623,7 @@ class IMSchemasPlugin(Star):
                     text=sub, code=code, pos=pos,
                     is_self_coded=False, is_missing=False,
                 )
-                cost = dp[i] + _key_presses(code, max_len, pos)
+                cost = dp[i] + _key_presses(code, max_len, pos, select_keys)
                 if cost < dp[j]:
                     dp[j] = cost
                     choice[j] = (i, seg)
@@ -758,6 +808,11 @@ class IMSchemasPlugin(Star):
     def _make_image(self, schema_name: str, word: str, owner_id: str, max_len: int, select_keys: str, force_single: bool = False) -> bytes:
         if len(word) == 1:
             codes_with_pos = self._query_codes_with_positions(schema_name, word)
+            # 末位为选重键的条目，按选重键位序覆盖 pos
+            codes_with_pos = [
+                (code, _explicit_select_pos(code, select_keys) or pos)
+                for code, pos in codes_with_pos
+            ]
             return self._make_single_char_image(schema_name, word, codes_with_pos, owner_id, max_len, select_keys)
         segments = self._query_segments(schema_name, word, max_len, select_keys, force_single=force_single)
         return self._make_multi_char_image(schema_name, word, segments, owner_id, max_len, select_keys)
@@ -786,11 +841,13 @@ class IMSchemasPlugin(Star):
                 key_seq_parts.append(seg.text)
             else:
                 code, pos = seg.code, seg.pos
-                if _next_self_coded(i) and pos == 1 and len(code) < max_len:
-                    per_presses.append(len(code))
-                    key_seq_parts.append(code)
+                omit = _omit_in_punct_context(code, pos, max_len, select_keys) if _next_self_coded(i) else None
+                if omit is not None:
+                    presses, disp = omit
+                    per_presses.append(presses)
+                    key_seq_parts.append(disp)
                 else:
-                    per_presses.append(_key_presses(code, max_len, pos))
+                    per_presses.append(_key_presses(code, max_len, pos, select_keys))
                     key_seq_parts.append(_code_display(code, max_len, pos, select_keys))
 
         # 缺字按「字」计数，与原版一致
@@ -840,12 +897,23 @@ class IMSchemasPlugin(Star):
             return self._measure(pdraw, text, fonts)
 
         # Build 打法 string
+        # 同时构造分段着色列表：每条候选可能是选重（红色）或普通（默认）
+        DEFAULT_COLOR = (40, 40, 40)
+        SELECT_COLOR = (200, 40, 40)
         dafa_parts = []
-        for code, pos in codes_with_pos:
-            dafa_parts.append(f"{code}({pos})")
-        dafa_str = "  ".join(dafa_parts)
+        dafa_pieces: list[tuple[str, tuple[int, int, int]]] = []
+        SEP = "  "
+        for idx, (code, pos) in enumerate(codes_with_pos):
+            piece = f"{code}({pos})"
+            dafa_parts.append(piece)
+            if idx > 0:
+                dafa_pieces.append((SEP, DEFAULT_COLOR))
+            dafa_pieces.append((piece, SELECT_COLOR if pos > 1 else DEFAULT_COLOR))
+        dafa_str = SEP.join(dafa_parts)
         if codes_with_pos:
-            dafa_str += f"  共{len(codes_with_pos)}个"
+            tail = f"{SEP}共{len(codes_with_pos)}个"
+            dafa_str += tail
+            dafa_pieces.append((tail, DEFAULT_COLOR))
 
         missing_placeholder = "??????"
         char_w, char_gh, char_bot = msr(word, fonts_char)
@@ -883,8 +951,14 @@ class IMSchemasPlugin(Star):
         y = PAD + top_bot + 16
         _render_text_with_fallback(draw, (PAD, y), dafa_label, fonts_info, (80, 80, 80))
         y += dlbot + 8
-        color = (40, 40, 40) if dafa_str else (180, 60, 220)
-        _render_text_with_fallback(draw, (PAD + 8, y), dafa_str or missing_placeholder, fonts_dafa, color)
+        if dafa_str:
+            x = PAD + 8
+            for piece, color in dafa_pieces:
+                _render_text_with_fallback(draw, (x, y), piece, fonts_dafa, color)
+                pw, _, _ = msr(piece, fonts_dafa)
+                x += pw
+        else:
+            _render_text_with_fallback(draw, (PAD + 8, y), missing_placeholder, fonts_dafa, (180, 60, 220))
 
         buf = BytesIO()
         img.save(buf, format="PNG")
@@ -931,12 +1005,14 @@ class IMSchemasPlugin(Star):
                 key_seq_parts.append(seg.text)
             else:
                 code, pos = seg.code, seg.pos
-                if _next_self_coded(i) and pos == 1 and len(code) < max_len:
-                    per_presses.append(len(code))
-                    cell_codes.append(code)
-                    key_seq_parts.append(code)
+                omit = _omit_in_punct_context(code, pos, max_len, select_keys) if _next_self_coded(i) else None
+                if omit is not None:
+                    presses, disp = omit
+                    per_presses.append(presses)
+                    cell_codes.append(disp)
+                    key_seq_parts.append(disp)
                 else:
-                    per_presses.append(_key_presses(code, max_len, pos))
+                    per_presses.append(_key_presses(code, max_len, pos, select_keys))
                     disp = _code_display(code, max_len, pos, select_keys)
                     cell_codes.append(disp)
                     key_seq_parts.append(disp)
@@ -1041,16 +1117,24 @@ class IMSchemasPlugin(Star):
                 if is_missing:
                     char_color = (180, 60, 220)
                     code_color = (180, 60, 220)
-                elif is_select:
-                    char_color = (200, 40, 40)
-                    code_color = (200, 40, 40)
                 elif is_self:
                     char_color = (80, 110, 160)
                     code_color = (80, 110, 160)
                 elif is_phrase:
-                    # 词组用绿色，与单字、选重、自编码区分
-                    char_color = (40, 130, 70)
-                    code_color = (40, 130, 70)
+                    # 词组按「不含末位选键的纯编码长度」分色：1/2/3 鲜绿/橙/蓝，≥4 灰
+                    code_len = _pure_code_len(seg.code or "", select_keys)
+                    if code_len <= 1:
+                        char_color = (0, 200, 80)
+                    elif code_len == 2:
+                        char_color = (255, 140, 0)
+                    elif code_len == 3:
+                        char_color = (30, 120, 230)
+                    else:
+                        char_color = (130, 130, 130)
+                    code_color = (200, 40, 40) if is_select else char_color
+                elif is_select:
+                    char_color = (200, 40, 40)
+                    code_color = (200, 40, 40)
                 else:
                     char_color = (30, 30, 30)
                     code_color = (80, 80, 80)
@@ -1295,12 +1379,12 @@ class IMSchemasPlugin(Star):
         await event.send(
             event.plain_result(
                 "文件已收到。请引用回复上方文件消息，并发送：\n"
-                "上传词提 [词提名]\n\n"
+                "/上传词提 [词提名]\n\n"
                 "可附加参数（空格分隔，均可省略）：\n"
                 "  选重键=_;'4567890\n"
                 "  最大长度=4\n"
                 "  标点引导键=\n\n"
-                "示例：上传词提 五笔86 选重键=_;' 最大长度=4"
+                "示例：/上传词提 五笔86 选重键=_;' 最大长度=4"
             )
         )
         event.stop_event()
@@ -1311,11 +1395,11 @@ class IMSchemasPlugin(Star):
     async def cmd_upload(self, event: AstrMessageEvent):
         """
         用法：引用回复码表文件消息，发送
-          上传词提 [词提名] [选重键=...] [最大长度=N] [标点引导键=...]
+          /上传词提 [词提名] [选重键=...] [最大长度=N] [标点引导键=...]
         """
         args_str = event.message_str.strip()
         if not args_str:
-            yield event.plain_result("用法：上传词提 [词提名] [选重键=...] [最大长度=N] [标点引导键=...]")
+            yield event.plain_result("用法：/上传词提 [词提名] [选重键=...] [最大长度=N] [标点引导键=...]")
             return
 
         # 解析词提名（第一个 token）和可选参数
@@ -1324,7 +1408,7 @@ class IMSchemasPlugin(Star):
         if tokens and tokens[0] == "上传词提":
             tokens = tokens[1:]
         if not tokens:
-            yield event.plain_result("用法：上传词提 [词提名] [选重键=...] [最大长度=N] [标点引导键=...]")
+            yield event.plain_result("用法：/上传词提 [词提名] [选重键=...] [最大长度=N] [标点引导键=...]")
             return
         schema_name = tokens[0]
         if len(schema_name) <= 1:
@@ -1435,29 +1519,78 @@ class IMSchemasPlugin(Star):
 
         return re.sub(r"\s+", "", raw)
 
-    @filter.regex(r"^(\S+)(?:\s+(\S+))?$")
+    @filter.regex(r"^(\S+)(?:\s+(.+))?$")
     async def cmd_query(self, event: AstrMessageEvent):
         text = event.message_str.strip()
-        m = re.match(r"^(\S+)(?:\s+(\S+))?$", text)
+        m = re.match(r"^(\S+)(?:\s+(.+))?$", text)
         if not m:
             return
-        schema_name, word = m.group(1), m.group(2)
-        if schema_name.startswith("%"):
+        head, rest = m.group(1), m.group(2)
+        if head.startswith("%"):
             return
 
-        # 强制单字查询：识别配置中的引导键前缀（支持正则）
-        force_single = False
         prefix_pat = (self.config.get("single_char_prefix", "") or "").strip()
-        if prefix_pat:
+
+        def _strip_force_prefix(token: str) -> tuple[str, bool]:
+            """剥离强制单字引导键前缀，返回 (词提名, 是否带前缀)。
+            仅当剥离后是已知词提名 / all 触发词时才认为前缀生效。"""
+            if not prefix_pat:
+                return token, False
             try:
-                pm = re.match(prefix_pat, schema_name)
+                pm = re.match(prefix_pat, token)
             except re.error:
-                pm = None
-            if pm and pm.end() > 0 and pm.end() < len(schema_name):
-                stripped = schema_name[pm.end():]
-                if self._is_all_trigger(stripped) or self._schema_exists(stripped):
-                    schema_name = stripped
-                    force_single = True
+                return token, False
+            if not pm or pm.end() <= 0 or pm.end() >= len(token):
+                return token, False
+            stripped = token[pm.end():]
+            if self._is_all_trigger(stripped) or self._schema_exists(stripped):
+                return stripped, True
+            return token, False
+
+        schema_name, force_single = _strip_force_prefix(head)
+
+        rest_tokens = rest.split() if rest else []
+
+        # 多词提对比：head 与 rest_tokens 全部为已知词提名（或 all 触发词，允许各自带 ! 前缀），
+        # 且消息引用了文本，视作一次性 all 组对比，仅渲染用户列出的这几套词提。
+        # 任一 token 带 ! 前缀，都对整组生效（force_single）。
+        rest_stripped: list[tuple[str, bool]] = [_strip_force_prefix(t) for t in rest_tokens]
+        head_is_known = self._is_all_trigger(schema_name) or self._schema_exists(schema_name)
+        rest_all_known = all(
+            self._is_all_trigger(n) or self._schema_exists(n) for n, _ in rest_stripped
+        )
+        if rest_tokens and head_is_known and rest_all_known:
+            reply_text = self._extract_reply_text(event)
+            if reply_text:
+                multi_force_single = force_single or any(f for _, f in rest_stripped)
+                names: list[str] = []
+                seen: set[str] = set()
+                for n in [schema_name, *(n for n, _ in rest_stripped)]:
+                    expanded = self._all_group_schemas() if self._is_all_trigger(n) else [n]
+                    for en in expanded:
+                        if en not in seen:
+                            names.append(en)
+                            seen.add(en)
+                if not names:
+                    return
+                try:
+                    if len(reply_text) > 10:
+                        img_bytes = self._make_all_summary_image(reply_text, names, force_single=multi_force_single)
+                    else:
+                        img_bytes = self._make_all_detail_image(reply_text, names, force_single=multi_force_single)
+                except Exception as e:
+                    logger.exception(f"[im_schemas] 生成多词提对比图片失败: {e}")
+                    yield event.plain_result(
+                        f"查询「{reply_text}」时渲染多词提对比图片失败。"
+                    )
+                    return
+                yield event.chain_result([AstrImage.fromBytes(img_bytes)])
+                return
+
+        # 未进入多词提对比，回到 [词提名] <字词> 形态：rest 必须是单 token 才视作 word
+        if len(rest_tokens) > 1:
+            return
+        word = rest_tokens[0] if rest_tokens else None
 
         # all 组：聚合多个方案的结果
         if self._is_all_trigger(schema_name):
@@ -1541,7 +1674,7 @@ class IMSchemasPlugin(Star):
         if schema_name.startswith("删除词提"):
             schema_name = schema_name[len("删除词提"):].strip()
         if not schema_name:
-            yield event.plain_result("用法：删除词提 [词提名]")
+            yield event.plain_result("用法：/删除词提 [词提名]")
             return
         owner = self._schema_owner(schema_name)
         if owner is None:
