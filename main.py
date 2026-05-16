@@ -75,8 +75,6 @@ class IMSchemasPlugin(Star):
                 "[im_schemas] 未找到 CJK 字体，图片中文字可能显示为方块。"
                 "请安装 wqy-microhei 或 noto-cjk 字体。"
             )
-        # 暂存：user_id -> File segment，等待 "上传词提" 指令消费
-        self._pending: dict[str, File] = {}
 
     # ── 数据库操作 ──────────────────────────────────────────────────────────
 
@@ -308,11 +306,11 @@ class IMSchemasPlugin(Star):
         img.save(buf, format="PNG")
         return buf.getvalue()
 
-    # ── 私聊：暂存文件，等待 "上传词提" 指令 ──────────────────────────────
+    # ── 私聊：收到文件时给出上传指引 ──────────────────────────────────────
 
-    @filter.event_message_type(filter.EventMessageType.FRIEND_MESSAGE)
+    @filter.event_message_type(filter.EventMessageType.PRIVATE_MESSAGE)
     async def handle_private_file(self, event: AstrMessageEvent):
-        """私聊收到文件时，暂存供后续 '上传词提' 指令使用。"""
+        """私聊收到文件时，提示用户引用回复该文件并发送上传指令。"""
         chain = event.get_messages()
         file_seg: Optional[File] = next(
             (seg for seg in chain if seg.type == ComponentType.File), None
@@ -323,11 +321,9 @@ class IMSchemasPlugin(Star):
             await event.send(event.plain_result("只支持 .txt 格式的 TSV 码表文件。"))
             event.stop_event()
             return
-        user_id = event.get_sender_id()
-        self._pending[user_id] = file_seg
         await event.send(
             event.plain_result(
-                "文件已收到。请引用回复本条消息并发送：\n"
+                "文件已收到。请引用回复上方文件消息，并发送：\n"
                 "上传词提 [词提名]\n\n"
                 "可附加参数（空格分隔，均可省略）：\n"
                 "  选重键=_;'4567890\n"
@@ -353,6 +349,12 @@ class IMSchemasPlugin(Star):
 
         # 解析词提名（第一个 token）和可选参数
         tokens = args_str.split()
+        # event.message_str 包含指令前缀，跳过它
+        if tokens and tokens[0] == "上传词提":
+            tokens = tokens[1:]
+        if not tokens:
+            yield event.plain_result("用法：上传词提 [词提名] [选重键=...] [最大长度=N] [标点引导键=...]")
+            return
         schema_name = tokens[0]
         select_keys = DEFAULT_SELECT_KEYS
         max_len = DEFAULT_MAX_LEN
@@ -370,7 +372,7 @@ class IMSchemasPlugin(Star):
             elif tok.startswith("标点引导键="):
                 punct_key = tok[6:]
 
-        # 从引用回复中找 File，或从暂存中取
+        # 从引用回复中找 File
         chain = event.get_messages()
         reply_seg: Optional[Reply] = next(
             (seg for seg in chain if seg.type == ComponentType.Reply), None
@@ -383,14 +385,9 @@ class IMSchemasPlugin(Star):
                 None,
             )
 
-        user_id = event.get_sender_id()
-        if file_seg is None:
-            # 尝试从暂存取
-            file_seg = self._pending.get(user_id)
-
         if file_seg is None:
             yield event.plain_result(
-                "未找到码表文件。请先发送 .txt 文件，再引用回复该消息并发送此指令。"
+                "未找到码表文件。请引用回复您上传的 .txt 文件消息，再发送此指令。"
             )
             return
 
@@ -413,10 +410,10 @@ class IMSchemasPlugin(Star):
             )
             return
 
+        user_id = event.get_sender_id()
         count = self._import_schema(
             schema_name, user_id, entries, select_keys, max_len, punct_key
         )
-        self._pending.pop(user_id, None)
         yield event.plain_result(
             f"词提「{schema_name}」导入成功！共 {count:,} 条编码。\n"
             f"查询：{schema_name} <字词>\n"
@@ -465,6 +462,8 @@ class IMSchemasPlugin(Star):
     @filter.command("删除词提")
     async def cmd_delete(self, event: AstrMessageEvent):
         schema_name = event.message_str.strip()
+        if schema_name.startswith("删除词提"):
+            schema_name = schema_name[len("删除词提"):].strip()
         if not schema_name:
             yield event.plain_result("用法：删除词提 [词提名]")
             return
