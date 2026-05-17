@@ -204,7 +204,7 @@ _RANK_ZONG_CIPIN, _RANK_VALID_CHAR, _RANK_PRE = _load_rank_data()
 
 def _text_difficulty(chars: list[str]) -> tuple[str, object]:
     """依据「字根月饼」的 rank 算法测算文本难度。
-    返回 (难度等级中文, 分数)；分数 >100 时返回字符串「爆表」。
+    返回 (难度等级中文, 分数)；分数 >100 时返回字符串「爆表{score}」。
     数据缺失或异常时返回 ("--", -1)。"""
     if not _RANK_VALID_CHAR or not _RANK_ZONG_CIPIN:
         return "--", -1
@@ -292,7 +292,7 @@ def _text_difficulty(chars: list[str]) -> tuple[str, object]:
         label = "虐"
 
     if score > 100:
-        return label, "爆表"
+        return label, f"爆表{score}"
     return label, score
 
 
@@ -381,6 +381,42 @@ def _load_pair_equivalence() -> dict[str, float]:
 
 
 _PAIR_EQUIVALENCE: dict[str, float] = _load_pair_equivalence()
+
+
+# QWERTY 热力图布局：(左缩进 in key 单位, [(label, key), ...])
+_QWERTY_ROWS: list[tuple[float, list[tuple[str, str]]]] = [
+    (0.0,  [("1", "1"), ("2", "2"), ("3", "3"), ("4", "4"), ("5", "5"), ("6", "6"),
+            ("7", "7"), ("8", "8"), ("9", "9"), ("0", "0"), ("-", "-"), ("=", "=")]),
+    (0.5,  [("Q", "q"), ("W", "w"), ("E", "e"), ("R", "r"), ("T", "t"),
+            ("Y", "y"), ("U", "u"), ("I", "i"), ("O", "o"), ("P", "p")]),
+    (0.75, [("A", "a"), ("S", "s"), ("D", "d"), ("F", "f"), ("G", "g"),
+            ("H", "h"), ("J", "j"), ("K", "k"), ("L", "l"), (";", ";")]),
+    (1.25, [("Z", "z"), ("X", "x"), ("C", "c"), ("V", "v"), ("B", "b"),
+            ("N", "n"), ("M", "m"), (",", ","), (".", "."), ("/", "/")]),
+]
+_KEY_SIZE = 44
+_KEY_GAP = 4
+_KEYBOARD_W = 12 * _KEY_SIZE + 11 * _KEY_GAP
+_KEYBOARD_H = 5 * _KEY_SIZE + 4 * _KEY_GAP
+
+
+def _build_key_counts(key_seq: str) -> dict[str, int]:
+    """统计每个键的按下次数；`_` 是首选键代号（多数方案配为空格），统一计入空格键。
+    全角/中文标点按物理键归并：`，。；：？！—…` 分别落到 `,. ; ; / 1 - .`。"""
+    # NFKC 把全角字母/数字/标点（FF00 区段）统一成半角
+    seq = unicodedata.normalize("NFKC", key_seq)
+    cjk_map = {
+        "。": ".", "、": ",", "—": "-", "…": ".",
+        "「": "[", "」": "]", "『": "[", "』": "]",
+        "《": "<", "》": ">", "·": "`",
+    }
+    counts: dict[str, int] = {}
+    for ch in seq:
+        c = cjk_map.get(ch, ch).lower()
+        if c == "_":
+            c = " "
+        counts[c] = counts.get(c, 0) + 1
+    return counts
 
 
 def _pair_equivalence_avg(key_seq: str) -> Optional[float]:
@@ -935,7 +971,7 @@ class IMSchemasPlugin(Star):
         gh = bot_off - (ref_asc + min_above)
         return w, gh, bot_off
 
-    def _make_image(self, schema_name: str, word: str, owner_id: str, max_len: int, select_keys: str, force_single: bool = False) -> bytes:
+    def _make_image(self, schema_name: str, word: str, owner_id: str, max_len: int, select_keys: str, force_single: bool = False, show_keyboard: bool = True) -> bytes:
         if len(word) == 1:
             codes_with_pos = self._query_codes_with_positions(schema_name, word)
             # 末位为选重键的条目，按选重键位序覆盖 pos
@@ -945,7 +981,7 @@ class IMSchemasPlugin(Star):
             ]
             return self._make_single_char_image(schema_name, word, codes_with_pos, owner_id, max_len, select_keys)
         segments = self._query_segments(schema_name, word, max_len, select_keys, force_single=force_single)
-        return self._make_multi_char_image(schema_name, word, segments, owner_id, max_len, select_keys)
+        return self._make_multi_char_image(schema_name, word, segments, owner_id, max_len, select_keys, show_keyboard=show_keyboard)
 
     def _compute_stats(
         self,
@@ -1094,6 +1130,65 @@ class IMSchemasPlugin(Star):
         img.save(buf, format="PNG")
         return buf.getvalue()
 
+    def _draw_keyboard_heatmap(
+        self,
+        draw: ImageDraw.ImageDraw,
+        origin: tuple[int, int],
+        counts: dict[str, int],
+    ) -> None:
+        """在 origin 处绘制一个 12 列宽的 QWERTY 键盘热力图。
+        色阶：未按 → 浅灰；按下 → 浅黄到深红的线性渐变（按 max(counts) 归一化）。"""
+        x0, y0 = origin
+        max_n = max(counts.values(), default=0)
+        fonts_label = _load_fonts(14)
+        fonts_count = _load_fonts(11)
+
+        def heat_color(n: int) -> tuple[int, int, int]:
+            if n <= 0 or max_n <= 0:
+                return (238, 238, 238)
+            t = n / max_n
+            # 浅黄 (255, 245, 180) → 深红 (200, 40, 40)
+            r = int(255 + (200 - 255) * t)
+            g = int(245 + (40 - 245) * t)
+            b = int(180 + (40 - 180) * t)
+            return (r, g, b)
+
+        def draw_key(kx: int, ky: int, kw: int, kh: int, label: str, key: str) -> None:
+            n = counts.get(key, 0)
+            fill = heat_color(n)
+            draw.rectangle(
+                [(kx, ky), (kx + kw, ky + kh)],
+                fill=fill, outline=(160, 160, 160), width=1,
+            )
+            t = (n / max_n) if max_n else 0
+            label_color = (255, 255, 255) if t >= 0.55 else (40, 40, 40)
+            count_color = (255, 255, 255) if t >= 0.55 else (90, 90, 90)
+            lw, _, lbot = self._measure(draw, label, fonts_label)
+            _render_text_with_fallback(
+                draw, (kx + (kw - lw) // 2, ky + 6),
+                label, fonts_label, label_color,
+            )
+            count_text = str(n) if n > 0 else ""
+            if count_text:
+                cw, _, _ = self._measure(draw, count_text, fonts_count)
+                _render_text_with_fallback(
+                    draw, (kx + (kw - cw) // 2, ky + kh - 16),
+                    count_text, fonts_count, count_color,
+                )
+
+        for r, (indent, row) in enumerate(_QWERTY_ROWS):
+            ky = y0 + r * (_KEY_SIZE + _KEY_GAP)
+            kx = x0 + int(indent * (_KEY_SIZE + _KEY_GAP))
+            for label, key in row:
+                draw_key(kx, ky, _KEY_SIZE, _KEY_SIZE, label, key)
+                kx += _KEY_SIZE + _KEY_GAP
+
+        # 第 5 行：空格键（占据中间 6 个键宽 + 间隔）
+        space_y = y0 + 4 * (_KEY_SIZE + _KEY_GAP)
+        space_w = 6 * _KEY_SIZE + 5 * _KEY_GAP
+        space_x = x0 + (_KEYBOARD_W - space_w) // 2
+        draw_key(space_x, space_y, space_w, _KEY_SIZE, "Space", " ")
+
     def _make_multi_char_image(
         self,
         schema_name: str,
@@ -1102,6 +1197,7 @@ class IMSchemasPlugin(Star):
         owner_id: str,
         max_len: int,
         select_keys: str,
+        show_keyboard: bool = True,
     ) -> bytes:
         PAD = 24
         CELL_GAP = 16
@@ -1178,9 +1274,11 @@ class IMSchemasPlugin(Star):
             cell_widths.append(max(cw, codew) + CELL_GAP)
 
         stats_w = max(msr(l, fonts_stats)[0] for l in [line1, line2, line3, line4])
-        MAX_IMG_W = 900
+        MAX_IMG_W = 1600
         content_w = sum(cell_widths)
-        IMG_W = max(min(PAD * 2 + content_w, MAX_IMG_W), PAD * 2 + stats_w, 400)
+        STATS_KB_GAP = 24
+        top_w = (stats_w + STATS_KB_GAP + _KEYBOARD_W) if show_keyboard else stats_w
+        IMG_W = max(min(PAD * 2 + content_w, MAX_IMG_W), PAD * 2 + top_w, 400)
         row_max_w = IMG_W - PAD * 2
 
         # 将单元按可用宽度切分成若干行
@@ -1204,8 +1302,10 @@ class IMSchemasPlugin(Star):
         CODE_GAP = 5
         ROW_H = char_bot + UL_GAP + 1 + CODE_GAP + code_bot
         ROW_GAP = 12
+        # 顶部带键盘时，留下 stats 和键盘里更高的那个
+        top_block_h = max(STATS_H, _KEYBOARD_H) if show_keyboard else STATS_H
         IMG_H = (
-            PAD + STATS_H + 16
+            PAD + top_block_h + 16
             + ROW_H * len(rows) + ROW_GAP * (len(rows) - 1)
             + PAD
         )
@@ -1213,12 +1313,20 @@ class IMSchemasPlugin(Star):
         img = Image.new("RGB", (IMG_W, IMG_H), (255, 255, 255))
         draw = ImageDraw.Draw(img)
 
-        y = PAD
+        # 顶部 stats 在左、键盘热力图在右上
+        stats_y = PAD + (top_block_h - STATS_H) // 2 if show_keyboard else PAD
+        y = stats_y
         for line in [line1, line2, line3, line4]:
             _render_text_with_fallback(draw, (PAD, y), line, fonts_stats, (50, 50, 50))
             y += LINE_H
 
-        grid_top = PAD + STATS_H + 16
+        if show_keyboard:
+            kb_x = IMG_W - PAD - _KEYBOARD_W
+            kb_y = PAD + (top_block_h - _KEYBOARD_H) // 2
+            counts = _build_key_counts("".join(key_seq_parts))
+            self._draw_keyboard_heatmap(draw, (kb_x, kb_y), counts)
+
+        grid_top = PAD + top_block_h + 16
         for r, row in enumerate(rows):
             char_y = grid_top + r * (ROW_H + ROW_GAP)
             ul_y = char_y + char_bot + UL_GAP
@@ -1285,7 +1393,18 @@ class IMSchemasPlugin(Star):
 
     # ── all 组：聚合多个方案的查询结果 ──────────────────────────────────────
 
-    def _make_all_detail_image(self, word: str, schema_names: list[str], force_single: bool = False) -> bytes:
+    @staticmethod
+    def _all_title_text(word: str, race_header: Optional[str], n_schemas: int) -> str:
+        """all 组标题：赛文显示首行+字数+难度，普通文本只显示字数+难度。
+        title 不再回显查询原文，避免冗长。"""
+        chars = list(word)
+        difficulty, diff_score = _text_difficulty(chars)
+        info = f"字数: {len(chars)}    难度: {difficulty}({diff_score})    （{n_schemas} 个方案）"
+        if race_header:
+            return f"{race_header}\n{info}"
+        return info
+
+    def _make_all_detail_image(self, word: str, schema_names: list[str], force_single: bool = False, race_header: Optional[str] = None) -> bytes:
         """≤10 字符：为 all 组每个方案生成完整打法图，竖向拼接。"""
         items: list[tuple[str, dict, bytes]] = []
         for name in schema_names:
@@ -1294,7 +1413,7 @@ class IMSchemasPlugin(Star):
                 continue
             segments = self._query_segments(name, word, info["max_len"], info["select_keys"], force_single=force_single)
             stats = self._compute_stats(word, segments, info["max_len"], info["select_keys"])
-            png = self._make_image(name, word, info["owner_id"], info["max_len"], info["select_keys"], force_single=force_single)
+            png = self._make_image(name, word, info["owner_id"], info["max_len"], info["select_keys"], force_single=force_single, show_keyboard=False)
             items.append((name, stats, png))
 
         if not items:
@@ -1303,12 +1422,37 @@ class IMSchemasPlugin(Star):
         items.sort(key=lambda t: self._all_sort_key(t[1]))
 
         sub_imgs = [Image.open(BytesIO(b)).convert("RGB") for _, _, b in items]
+
+        PAD = 24
+        TITLE_GAP = 16
+        fonts_title = _load_fonts(20)
+        probe = Image.new("RGB", (1, 1))
+        pdraw = ImageDraw.Draw(probe)
+        title = self._all_title_text(word, race_header, len(items))
+        title_lines = title.split("\n")
+        line_widths: list[int] = []
+        line_bots: list[int] = []
+        for ln in title_lines:
+            lw, _, lbot = self._measure(pdraw, ln, fonts_title)
+            line_widths.append(lw)
+            line_bots.append(lbot)
+        LINE_GAP = 4
+        title_h = sum(line_bots) + LINE_GAP * (len(title_lines) - 1)
+        title_w = max(line_widths) if line_widths else 0
+
         GAP = 16
-        IMG_W = max(im.width for im in sub_imgs)
-        IMG_H = sum(im.height for im in sub_imgs) + GAP * (len(sub_imgs) - 1)
+        body_w = max(im.width for im in sub_imgs)
+        IMG_W = max(body_w, PAD * 2 + title_w)
+        body_h = sum(im.height for im in sub_imgs) + GAP * (len(sub_imgs) - 1)
+        IMG_H = PAD + title_h + TITLE_GAP + body_h
 
         canvas = Image.new("RGB", (IMG_W, IMG_H), (255, 255, 255))
-        y = 0
+        draw = ImageDraw.Draw(canvas)
+        ty = PAD
+        for ln, lbot in zip(title_lines, line_bots):
+            _render_text_with_fallback(draw, (PAD, ty), ln, fonts_title, (30, 30, 30))
+            ty += lbot + LINE_GAP
+        y = PAD + title_h + TITLE_GAP
         for im in sub_imgs:
             canvas.paste(im, (0, y))
             y += im.height + GAP
@@ -1317,7 +1461,7 @@ class IMSchemasPlugin(Star):
         canvas.save(buf, format="PNG")
         return buf.getvalue()
 
-    def _make_all_summary_image(self, word: str, schema_names: list[str], force_single: bool = False) -> bytes:
+    def _make_all_summary_image(self, word: str, schema_names: list[str], force_single: bool = False, race_header: Optional[str] = None) -> bytes:
         """>10 字符：每个方案一行，仅展示 来源 / 码长 / 选重 / 缺字 / 当量。"""
         rows_data: list[dict] = []
         for name in schema_names:
@@ -1349,8 +1493,17 @@ class IMSchemasPlugin(Star):
         def msr(text, fonts):
             return self._measure(pdraw, text, fonts)
 
-        title = f"all 组查询：{word[:20]}{'…' if len(word) > 20 else ''}（{len(rows_data)} 个方案）"
-        tw, _, tbot = msr(title, fonts_title)
+        title = self._all_title_text(word, race_header, len(rows_data))
+        title_lines = title.split("\n")
+        line_widths: list[int] = []
+        line_bots: list[int] = []
+        for ln in title_lines:
+            lw, _, lbot = msr(ln, fonts_title)
+            line_widths.append(lw)
+            line_bots.append(lbot)
+        TITLE_LINE_GAP = 4
+        title_h = sum(line_bots) + TITLE_LINE_GAP * (len(title_lines) - 1)
+        tw = max(line_widths) if line_widths else 0
 
         headers = ["方案", "来源", "码长", "选重", "缺字", "当量"]
 
@@ -1382,14 +1535,17 @@ class IMSchemasPlugin(Star):
 
         IMG_W = PAD * 2 + sum(col_widths) + COL_GAP * (n_cols - 1)
         IMG_W = max(IMG_W, PAD * 2 + tw, 400)
-        IMG_H = PAD + tbot + 16 + ROW_H * len(all_rows_text) + PAD
+        IMG_H = PAD + title_h + 16 + ROW_H * len(all_rows_text) + PAD
 
         img = Image.new("RGB", (IMG_W, IMG_H), (255, 255, 255))
         draw = ImageDraw.Draw(img)
 
-        _render_text_with_fallback(draw, (PAD, PAD), title, fonts_title, (30, 30, 30))
+        ty = PAD
+        for ln, lbot in zip(title_lines, line_bots):
+            _render_text_with_fallback(draw, (PAD, ty), ln, fonts_title, (30, 30, 30))
+            ty += lbot + TITLE_LINE_GAP
 
-        y = PAD + tbot + 16
+        y = PAD + title_h + 16
         # 表头
         x = PAD
         for i, cell in enumerate(headers):
@@ -1475,7 +1631,7 @@ class IMSchemasPlugin(Star):
         SEP = "　"
 
         # 估算图宽：取 title / 各 code 头 / 各 word 行的最大宽度
-        MAX_IMG_W = 900
+        MAX_IMG_W = 1600
         widest = msr(title, fonts_title)[0]
         for c in uniq_codes:
             words = lookup.get(c, [])
@@ -1610,7 +1766,7 @@ class IMSchemasPlugin(Star):
         items = [f"{name}（{owner}）" for name, owner in schemas]
         sep = "、"
 
-        MAX_IMG_W = 900
+        MAX_IMG_W = 1600
         tw, _, tbot = msr(title, fonts_title)
         IMG_W = max(min(PAD * 2 + max((msr(it + sep, fonts_body)[0] for it in items), default=0), MAX_IMG_W),
                     PAD * 2 + tw, 400)
@@ -1787,15 +1943,16 @@ class IMSchemasPlugin(Star):
     # ── 查码：[词提名] <字词>，或引用回复+[词提名] ─────────────────────────
 
     @staticmethod
-    def _extract_reply_text(event: AstrMessageEvent) -> str:
+    def _extract_reply_text(event: AstrMessageEvent) -> tuple[str, Optional[str]]:
         """从引用回复链中抽取所有纯文本片段，去掉空白字符。
-        赛文格式（末段以五个"-"开头）会自动剥离首末两段无效信息，仅保留正文。"""
+        返回 (body, race_header)：body 为查询用纯文本，race_header 仅当回复符合赛文
+        格式（末段以五个"-"开头）时为赛文首行信息，否则为 None。"""
         chain = event.get_messages()
         reply_seg: Optional[Reply] = next(
             (seg for seg in chain if seg.type == ComponentType.Reply), None
         )
         if not reply_seg or not getattr(reply_seg, "chain", None):
-            return ""
+            return "", None
         parts: list[str] = []
         for seg in reply_seg.chain:
             txt = getattr(seg, "text", None)
@@ -1804,15 +1961,19 @@ class IMSchemasPlugin(Star):
         raw = "".join(parts)
 
         paragraphs = [p for p in re.split(r"\r?\n", raw) if p.strip()]
+        race_header: Optional[str] = None
         if len(paragraphs) >= 3 and paragraphs[-1].lstrip().startswith("-----"):
+            race_header = paragraphs[0].strip()
             paragraphs = paragraphs[1:-1]
             raw = "\n".join(paragraphs)
 
-        return re.sub(r"\s+", "", raw)
+        return re.sub(r"\s+", "", raw), race_header
 
-    @filter.regex(r"^(\S+)(?:\s+(.+))?$")
+    @filter.regex(r"^(?:@\S+\s+)*\S+(?:\s+(?:.+))?$")
     async def cmd_query(self, event: AstrMessageEvent):
         text = event.message_str.strip()
+        # 引用回复时，QQ 客户端会在消息开头自动追加 `@对方` 提及，剥离后再做查询匹配
+        text = re.sub(r"^(?:@\S+\s+)+", "", text)
         m = re.match(r"^(\S+)(?:\s+(.+))?$", text)
         if not m:
             return
@@ -1879,7 +2040,7 @@ class IMSchemasPlugin(Star):
             self._is_all_trigger(n) or self._schema_exists(n) for n, _ in rest_stripped
         )
         if rest_tokens and head_is_known and rest_all_known:
-            reply_text = self._extract_reply_text(event)
+            reply_text, reply_race_header = self._extract_reply_text(event)
             if reply_text:
                 multi_force_single = force_single or any(f for _, f in rest_stripped)
                 names: list[str] = []
@@ -1894,9 +2055,17 @@ class IMSchemasPlugin(Star):
                     return
                 try:
                     if len(reply_text) > 10:
-                        img_bytes = self._make_all_summary_image(reply_text, names, force_single=multi_force_single)
+                        img_bytes = self._make_all_summary_image(
+                            reply_text, names,
+                            force_single=multi_force_single,
+                            race_header=reply_race_header,
+                        )
                     else:
-                        img_bytes = self._make_all_detail_image(reply_text, names, force_single=multi_force_single)
+                        img_bytes = self._make_all_detail_image(
+                            reply_text, names,
+                            force_single=multi_force_single,
+                            race_header=reply_race_header,
+                        )
                 except Exception as e:
                     logger.exception(f"[im_schemas] 生成多词提对比图片失败: {e}")
                     yield event.plain_result(
@@ -1911,16 +2080,25 @@ class IMSchemasPlugin(Star):
 
         # all 组：聚合多个方案的结果
         if self._is_all_trigger(schema_name):
+            race_header: Optional[str] = None
             if not word:
-                word = self._extract_reply_text(event)
+                word, race_header = self._extract_reply_text(event)
                 if not word:
                     return
             schema_names = self._all_group_schemas()
             try:
                 if len(word) > 10:
-                    img_bytes = self._make_all_summary_image(word, schema_names, force_single=force_single)
+                    img_bytes = self._make_all_summary_image(
+                        word, schema_names,
+                        force_single=force_single,
+                        race_header=race_header,
+                    )
                 else:
-                    img_bytes = self._make_all_detail_image(word, schema_names, force_single=force_single)
+                    img_bytes = self._make_all_detail_image(
+                        word, schema_names,
+                        force_single=force_single,
+                        race_header=race_header,
+                    )
             except Exception as e:
                 logger.exception(f"[im_schemas] 生成 all 组查询图片失败: {e}")
                 yield event.plain_result(
@@ -1935,7 +2113,7 @@ class IMSchemasPlugin(Star):
             return
 
         if not word:
-            word = self._extract_reply_text(event)
+            word, _ = self._extract_reply_text(event)
             if not word:
                 return
 
