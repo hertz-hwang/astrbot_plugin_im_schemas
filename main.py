@@ -21,7 +21,7 @@ except ImportError:
         if "fonttools" in key.lower() or "fontTools" in key:
             del sys.modules[key]
     from fontTools.ttLib import TTCollection, TTFont
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFilter, ImageFont
 
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, filter
@@ -953,6 +953,119 @@ class IMSchemasPlugin(Star):
     # ── 图片生成 ────────────────────────────────────────────────────────────
 
     @staticmethod
+    def _decorate(content: Image.Image) -> Image.Image:
+        """把内容图嵌入装饰画布：淡绿渐变背景 + 圆角白卡 + 顶部彩条 + 柔和阴影。
+        参考 tmp/text_to_img.html 的视觉风格。"""
+        cw, ch = content.size
+        OUTER = 28          # 卡片到画布边缘的留白
+        RADIUS = 22         # 卡片圆角半径
+        SHADOW_BLUR = 18
+        SHADOW_OFFSET = 6
+        SHADOW_PAD = SHADOW_BLUR + SHADOW_OFFSET
+        BAR_INSET = 28      # 顶部彩条左右内缩
+        BAR_H = 3
+
+        W = cw + OUTER * 2
+        H = ch + OUTER * 2
+
+        # 1) 渐变背景：上浅下更浅的青绿，叠两个角落径向高光
+        bg = Image.new("RGB", (W, H), (247, 250, 248))
+        bg_draw = ImageDraw.Draw(bg)
+        for y in range(H):
+            t = y / max(1, H - 1)
+            # #f7faf8 → #f3f7f5
+            r = int(247 + (243 - 247) * t)
+            g = int(250 + (247 - 250) * t)
+            b = int(248 + (245 - 248) * t)
+            bg_draw.line([(0, y), (W, y)], fill=(r, g, b))
+        # 左上 / 右上柔光（半径 ~ 较短边的 0.7）
+        glow = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+        gd = ImageDraw.Draw(glow)
+        rg = max(W, H)
+        # 左上 #5fc999 ~ 8% 不透明
+        gd.ellipse(
+            [-rg // 2, -rg // 2, rg // 2, rg // 2],
+            fill=(95, 201, 153, 28),
+        )
+        # 右上 #3eaf7c ~ 6% 不透明
+        gd.ellipse(
+            [W - rg // 2, -rg // 2, W + rg // 2, rg // 2],
+            fill=(62, 175, 124, 22),
+        )
+        glow = glow.filter(ImageFilter.GaussianBlur(60))
+        bg = bg.convert("RGBA")
+        bg.alpha_composite(glow)
+
+        # 2) 卡片阴影：黑 12% 的圆角矩形 → 高斯模糊 → 偏移
+        shadow_canvas = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+        sd = ImageDraw.Draw(shadow_canvas)
+        sd.rounded_rectangle(
+            [OUTER, OUTER + SHADOW_OFFSET, OUTER + cw, OUTER + ch + SHADOW_OFFSET],
+            radius=RADIUS,
+            fill=(45, 138, 95, 38),
+        )
+        shadow_canvas = shadow_canvas.filter(ImageFilter.GaussianBlur(SHADOW_BLUR))
+        bg.alpha_composite(shadow_canvas)
+
+        # 3) 圆角白卡（用 mask 把内容图剪成圆角），再加 1px 浅边
+        card = Image.new("RGBA", (cw, ch), (255, 255, 255, 255))
+        # 把传入的内容（白底）原样贴到 card 上
+        if content.mode != "RGBA":
+            card.paste(content.convert("RGB"), (0, 0))
+        else:
+            card.alpha_composite(content)
+        mask = Image.new("L", (cw, ch), 0)
+        ImageDraw.Draw(mask).rounded_rectangle(
+            [0, 0, cw, ch], radius=RADIUS, fill=255,
+        )
+        card.putalpha(mask)
+        # 边框：在 mask 上用浅色描边，单独贴
+        border = Image.new("RGBA", (cw, ch), (0, 0, 0, 0))
+        ImageDraw.Draw(border).rounded_rectangle(
+            [0, 0, cw - 1, ch - 1], radius=RADIUS,
+            outline=(232, 236, 239, 255), width=1,
+        )
+        card.alpha_composite(border)
+        bg.alpha_composite(card, dest=(OUTER, OUTER))
+
+        # 4) 顶部彩条（左右淡出 → 中间饱和）
+        bar = Image.new("RGBA", (cw - BAR_INSET * 2, BAR_H), (0, 0, 0, 0))
+        bar_draw = ImageDraw.Draw(bar)
+        bw = bar.width
+        for x in range(bw):
+            t = x / max(1, bw - 1)
+            if t < 0.2:
+                color = (62, 175, 124, int(255 * (t / 0.2) * 0.6))
+            elif t < 0.5:
+                k = (t - 0.2) / 0.3
+                r = int(62 + (79 - 62) * k)
+                g = int(175 + (209 - 175) * k)
+                b = int(124 + (168 - 124) * k)
+                color = (r, g, b, int(255 * 0.6))
+            elif t < 0.8:
+                k = (t - 0.5) / 0.3
+                r = int(79 + (62 - 79) * k)
+                g = int(209 + (175 - 209) * k)
+                b = int(168 + (124 - 168) * k)
+                color = (r, g, b, int(255 * 0.6))
+            else:
+                k = (t - 0.8) / 0.2
+                color = (62, 175, 124, int(255 * (1 - k) * 0.6))
+            bar_draw.line([(x, 0), (x, BAR_H)], fill=color)
+        bg.alpha_composite(bar, dest=(OUTER + BAR_INSET, OUTER))
+
+        return bg.convert("RGB")
+
+    @staticmethod
+    def _to_png_bytes(img: Image.Image, decorate: bool = True) -> bytes:
+        """统一出口：可选地套上装饰边框，再编码为 PNG 字节。"""
+        if decorate:
+            img = IMSchemasPlugin._decorate(img)
+        buf = BytesIO()
+        img.save(buf, format="PNG")
+        return buf.getvalue()
+
+    @staticmethod
     def _measure(draw, text: str, fonts) -> tuple[int, int, int]:
         """Returns (width, glyph_height, bottom_offset).
         基于统一基线（max ascent）计算，与 _render_text_with_fallback 保持一致：
@@ -980,7 +1093,7 @@ class IMSchemasPlugin(Star):
         gh = bot_off - (ref_asc + min_above)
         return w, gh, bot_off
 
-    def _make_image(self, schema_name: str, word: str, owner_id: str, max_len: int, select_keys: str, force_single: bool = False, show_keyboard: bool = True) -> bytes:
+    def _make_image(self, schema_name: str, word: str, owner_id: str, max_len: int, select_keys: str, force_single: bool = False, show_keyboard: bool = True, decorate: bool = True) -> bytes:
         if len(word) == 1:
             codes_with_pos = self._query_codes_with_positions(schema_name, word)
             # 末位为选重键的条目，按选重键位序覆盖 pos
@@ -988,9 +1101,9 @@ class IMSchemasPlugin(Star):
                 (code, _explicit_select_pos(code, select_keys) or pos)
                 for code, pos in codes_with_pos
             ]
-            return self._make_single_char_image(schema_name, word, codes_with_pos, owner_id, max_len, select_keys)
+            return self._make_single_char_image(schema_name, word, codes_with_pos, owner_id, max_len, select_keys, decorate=decorate)
         segments = self._query_segments(schema_name, word, max_len, select_keys, force_single=force_single)
-        return self._make_multi_char_image(schema_name, word, segments, owner_id, max_len, select_keys, show_keyboard=show_keyboard)
+        return self._make_multi_char_image(schema_name, word, segments, owner_id, max_len, select_keys, show_keyboard=show_keyboard, decorate=decorate)
 
     def _compute_stats(
         self,
@@ -1006,11 +1119,12 @@ class IMSchemasPlugin(Star):
         def _next_self_coded(i: int) -> bool:
             return i + 1 < n and segments[i + 1].is_self_coded and _is_punct(segments[i + 1].text)
 
-        per_presses: list[Optional[int]] = []
+        per_presses: list[int] = []
         key_seq_parts: list[str] = []
         for i, seg in enumerate(segments):
             if seg.is_missing:
-                per_presses.append(None)
+                # 缺字显示为 6 个问号，码长按 6 计入（每个缺字字符算 6 键）
+                per_presses.append(6 * len(seg.text))
             elif seg.is_self_coded:
                 per_presses.append(1)
                 key_seq_parts.append(seg.text)
@@ -1025,13 +1139,11 @@ class IMSchemasPlugin(Star):
                     per_presses.append(_key_presses(code, max_len, pos, select_keys))
                     key_seq_parts.append(_code_display(code, max_len, pos, select_keys))
 
-        # 缺字按「字」计数，与原版一致
         missing = sum(len(seg.text) for seg in segments if seg.is_missing)
         sel_count = sum(1 for seg in segments if not seg.is_self_coded and not seg.is_missing and seg.pos > 1)
-        counted = [p for p in per_presses if p is not None]
-        # 码长按「字」均摊：总按键 / 非缺字字数，与原版口径保持一致
-        counted_chars = sum(len(seg.text) for seg in segments if not seg.is_missing)
-        total_presses = sum(counted)
+        # 码长按「字」均摊；缺字按 6 键计入分子与分母
+        counted_chars = sum(len(seg.text) for seg in segments)
+        total_presses = sum(per_presses)
         avg_len = total_presses / counted_chars if counted_chars else 0.0
         equivalence = _pair_equivalence_avg("".join(key_seq_parts))
         return {
@@ -1059,6 +1171,7 @@ class IMSchemasPlugin(Star):
         owner_id: str,
         max_len: int,
         select_keys: str,
+        decorate: bool = True,
     ) -> bytes:
         PAD = 24
         fonts_char = _load_fonts(80)
@@ -1158,9 +1271,7 @@ class IMSchemasPlugin(Star):
         else:
             _render_text_with_fallback(draw, (PAD + 8, y), missing_placeholder, fonts_dafa, (180, 60, 220))
 
-        buf = BytesIO()
-        img.save(buf, format="PNG")
-        return buf.getvalue()
+        return self._to_png_bytes(img, decorate=decorate)
 
     def _draw_keyboard_heatmap(
         self,
@@ -1230,6 +1341,7 @@ class IMSchemasPlugin(Star):
         max_len: int,
         select_keys: str,
         show_keyboard: bool = True,
+        decorate: bool = True,
     ) -> bytes:
         PAD = 24
         CELL_GAP = 16
@@ -1251,12 +1363,13 @@ class IMSchemasPlugin(Star):
             return i + 1 < n and segments[i + 1].is_self_coded and _is_punct(segments[i + 1].text)
 
         # 每段按键数 + 显示码串
-        per_presses: list[Optional[int]] = []
+        per_presses: list[int] = []
         cell_codes: list[Optional[str]] = []
         key_seq_parts: list[str] = []
         for i, seg in enumerate(segments):
             if seg.is_missing:
-                per_presses.append(None)
+                # 缺字显示为 6 个问号，码长按 6 计入
+                per_presses.append(6 * len(seg.text))
                 cell_codes.append(None)
             elif seg.is_self_coded:
                 per_presses.append(1)
@@ -1279,8 +1392,8 @@ class IMSchemasPlugin(Star):
         chars = list(word)
         missing = sum(len(seg.text) for seg in segments if seg.is_missing)
         sel_count = sum(1 for seg in segments if not seg.is_self_coded and not seg.is_missing and seg.pos > 1)
-        counted_chars = sum(len(seg.text) for seg in segments if not seg.is_missing)
-        total_presses = sum(p for p in per_presses if p is not None)
+        counted_chars = sum(len(seg.text) for seg in segments)
+        total_presses = sum(per_presses)
         avg_len = total_presses / counted_chars if counted_chars else 0.0
         difficulty, diff_score = _text_difficulty(chars)
         equivalence = _pair_equivalence_avg("".join(key_seq_parts))
@@ -1432,9 +1545,7 @@ class IMSchemasPlugin(Star):
 
                 x += cell_widths[i]
 
-        buf = BytesIO()
-        img.save(buf, format="PNG")
-        return buf.getvalue()
+        return self._to_png_bytes(img, decorate=decorate)
 
     # ── all 组：聚合多个方案的查询结果 ──────────────────────────────────────
 
@@ -1458,7 +1569,7 @@ class IMSchemasPlugin(Star):
                 continue
             segments = self._query_segments(name, word, info["max_len"], info["select_keys"], force_single=force_single)
             stats = self._compute_stats(word, segments, info["max_len"], info["select_keys"])
-            png = self._make_image(name, word, info["owner_id"], info["max_len"], info["select_keys"], force_single=force_single, show_keyboard=False)
+            png = self._make_image(name, word, info["owner_id"], info["max_len"], info["select_keys"], force_single=force_single, show_keyboard=False, decorate=False)
             items.append((name, stats, png))
 
         if not items:
@@ -1502,9 +1613,7 @@ class IMSchemasPlugin(Star):
             canvas.paste(im, (0, y))
             y += im.height + GAP
 
-        buf = BytesIO()
-        canvas.save(buf, format="PNG")
-        return buf.getvalue()
+        return self._to_png_bytes(canvas)
 
     def _make_all_summary_image(self, word: str, schema_names: list[str], force_single: bool = False, race_header: Optional[str] = None) -> bytes:
         """>10 字符：每个方案一行，仅展示 来源 / 码长 / 选重 / 缺字 / 当量。"""
@@ -1611,9 +1720,7 @@ class IMSchemasPlugin(Star):
                 x += col_widths[i] + COL_GAP
             y += ROW_H
 
-        buf = BytesIO()
-        img.save(buf, format="PNG")
-        return buf.getvalue()
+        return self._to_png_bytes(img)
 
     def _make_all_empty_image(self, word: str) -> bytes:
         """all 组未配置或方案均不存在时的占位图。"""
@@ -1628,9 +1735,7 @@ class IMSchemasPlugin(Star):
         img = Image.new("RGB", (IMG_W, IMG_H), (255, 255, 255))
         draw = ImageDraw.Draw(img)
         _render_text_with_fallback(draw, (PAD, PAD), text, fonts, (180, 60, 60))
-        buf = BytesIO()
-        img.save(buf, format="PNG")
-        return buf.getvalue()
+        return self._to_png_bytes(img)
 
     def _make_reverse_image(
         self,
@@ -1638,6 +1743,7 @@ class IMSchemasPlugin(Star):
         codes: list[str],
         owner_id: str,
         select_keys: str,
+        decorate: bool = True,
     ) -> bytes:
         """编码反查图：列出每个 code 在该方案下对应的字词，按 rowid 顺序给出位序。
         位序 1（首选）默认色，位序 ≥2（选重）用红色与正常查询一致。"""
@@ -1760,9 +1866,7 @@ class IMSchemasPlugin(Star):
                 y += word_bot + LINE_GAP
             y += BLOCK_GAP
 
-        buf = BytesIO()
-        img.save(buf, format="PNG")
-        return buf.getvalue()
+        return self._to_png_bytes(img, decorate=decorate)
 
     def _make_reverse_all_image(
         self, codes: list[str], schema_names: list[str]
@@ -1774,7 +1878,7 @@ class IMSchemasPlugin(Star):
             if not info:
                 continue
             png = self._make_reverse_image(
-                name, codes, info["owner_id"], info["select_keys"]
+                name, codes, info["owner_id"], info["select_keys"], decorate=False,
             )
             sub_imgs.append(Image.open(BytesIO(png)).convert("RGB"))
 
@@ -1789,9 +1893,7 @@ class IMSchemasPlugin(Star):
         for im in sub_imgs:
             canvas.paste(im, (0, y))
             y += im.height + GAP
-        buf = BytesIO()
-        canvas.save(buf, format="PNG")
-        return buf.getvalue()
+        return self._to_png_bytes(canvas)
 
     def _make_schemas_list_image(self, schemas: list[tuple[str, str]]) -> bytes:
         """渲染所有词提名图片：首行统计，正文为「词提名（来源）、…」自动换行。"""
@@ -1849,9 +1951,7 @@ class IMSchemasPlugin(Star):
             _render_text_with_fallback(draw, (PAD, y), line, fonts_body, (40, 40, 40))
             y += LINE_H
 
-        buf = BytesIO()
-        img.save(buf, format="PNG")
-        return buf.getvalue()
+        return self._to_png_bytes(img)
 
     # ── 私聊：收到文件时给出上传指引 ──────────────────────────────────────
 
@@ -1871,12 +1971,12 @@ class IMSchemasPlugin(Star):
         await event.send(
             event.plain_result(
                 "文件已收到。请引用回复上方文件消息，并发送：\n"
-                "bot上传词提 [词提名]\n\n"
+                "khkh上传词提 [词提名]\n\n"
                 "可附加参数（空格分隔，均可省略）：\n"
                 "  选重键=_;'4567890\n"
                 "  最大长度=4\n"
                 "  标点引导键=\n\n"
-                "示例：bot上传词提 五笔86 选重键=_;' 最大长度=4"
+                "示例：khkh上传词提 五笔86 选重键=_;' 最大长度=4"
             )
         )
         event.stop_event()
@@ -1887,11 +1987,11 @@ class IMSchemasPlugin(Star):
     async def cmd_upload(self, event: AstrMessageEvent):
         """
         用法：引用回复码表文件消息，发送
-          bot上传词提 [词提名] [选重键=...] [最大长度=N] [标点引导键=...]
+          khkh上传词提 [词提名] [选重键=...] [最大长度=N] [标点引导键=...]
         """
         args_str = event.message_str.strip()
         if not args_str:
-            yield event.plain_result("用法：bot上传词提 [词提名] [选重键=...] [最大长度=N] [标点引导键=...]")
+            yield event.plain_result("用法：khkh上传词提 [词提名] [选重键=...] [最大长度=N] [标点引导键=...]")
             return
 
         # 解析词提名（第一个 token）和可选参数
@@ -1900,7 +2000,7 @@ class IMSchemasPlugin(Star):
         if tokens and tokens[0] == "上传词提":
             tokens = tokens[1:]
         if not tokens:
-            yield event.plain_result("用法：bot上传词提 [词提名] [选重键=...] [最大长度=N] [标点引导键=...]")
+            yield event.plain_result("用法：khkh上传词提 [词提名] [选重键=...] [最大长度=N] [标点引导键=...]")
             return
         schema_name = tokens[0]
         if len(schema_name) <= 1:
@@ -2214,7 +2314,7 @@ class IMSchemasPlugin(Star):
         if schema_name.startswith("删除词提"):
             schema_name = schema_name[len("删除词提"):].strip()
         if not schema_name:
-            yield event.plain_result("用法：bot删除词提 [词提名]")
+            yield event.plain_result("用法：khkh删除词提 [词提名]")
             return
         owner = self._schema_owner(schema_name)
         if owner is None:
