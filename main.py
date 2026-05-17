@@ -131,16 +131,23 @@ def _char_advance(size: int, ch: str) -> tuple[int, int, int, int]:
     return fi, bb[2] - bb[0], bb[1], bb[3]
 
 
-def _render_text_with_fallback(draw, pos, text: str, fonts, fill):
+def _render_text_with_fallback(draw, pos, text: str, fonts, fill, stroke_width: int = 0, baseline: Optional[int] = None):
     """逐字符渲染，所有候选字体共享同一条基线，避免 PUA 等回退字体高度不齐。
-    复用 _char_bbox 缓存的 advance 宽度，避免每字一次 textbbox。"""
+    复用 _char_bbox 缓存的 advance 宽度，避免每字一次 textbbox。
+    stroke_width>0 时用同色描边模拟伪粗体（不改变 advance，仅微涨笔画）。
+    baseline 显式指定时用作渲染基线，便于不同字号在同一基线上对齐。"""
     x, y_top = pos
     size = fonts[0].size if fonts else 0
-    baseline = y_top + _ref_ascent(fonts)
+    if baseline is None:
+        baseline = y_top + _ref_ascent(fonts)
     for ch in text:
         fi, adv, _, _ = _char_advance(size, ch)
         f = fonts[fi] if fi < len(fonts) else fonts[0]
-        draw.text((x, baseline), ch, font=f, fill=fill, anchor="ls")
+        draw.text(
+            (x, baseline), ch, font=f, fill=fill, anchor="ls",
+            stroke_width=stroke_width,
+            stroke_fill=fill if stroke_width else None,
+        )
         x += adv
 
 
@@ -388,25 +395,27 @@ _QWERTY_ROWS: list[tuple[float, list[tuple[str, str]]]] = [
     (0.0,  [("1", "1"), ("2", "2"), ("3", "3"), ("4", "4"), ("5", "5"), ("6", "6"),
             ("7", "7"), ("8", "8"), ("9", "9"), ("0", "0"), ("-", "-"), ("=", "=")]),
     (0.5,  [("Q", "q"), ("W", "w"), ("E", "e"), ("R", "r"), ("T", "t"),
-            ("Y", "y"), ("U", "u"), ("I", "i"), ("O", "o"), ("P", "p")]),
+            ("Y", "y"), ("U", "u"), ("I", "i"), ("O", "o"), ("P", "p"),
+            ("[", "["), ("]", "]")]),
     (0.75, [("A", "a"), ("S", "s"), ("D", "d"), ("F", "f"), ("G", "g"),
-            ("H", "h"), ("J", "j"), ("K", "k"), ("L", "l"), (";", ";")]),
+            ("H", "h"), ("J", "j"), ("K", "k"), ("L", "l"), (";", ";"),
+            ("'", "'")]),
     (1.25, [("Z", "z"), ("X", "x"), ("C", "c"), ("V", "v"), ("B", "b"),
             ("N", "n"), ("M", "m"), (",", ","), (".", "."), ("/", "/")]),
 ]
 _KEY_SIZE = 44
 _KEY_GAP = 4
-_KEYBOARD_W = 12 * _KEY_SIZE + 11 * _KEY_GAP
+_KEYBOARD_W = 13 * _KEY_SIZE + 12 * _KEY_GAP
 _KEYBOARD_H = 5 * _KEY_SIZE + 4 * _KEY_GAP
 
 
 def _build_key_counts(key_seq: str) -> dict[str, int]:
     """统计每个键的按下次数；`_` 是首选键代号（多数方案配为空格），统一计入空格键。
-    全角/中文标点按物理键归并：`，。；：？！—…` 分别落到 `,. ; ; / 1 - .`。"""
+    全角/中文标点按物理键归并：`、。—…` 分别落到 `/ . - .`。"""
     # NFKC 把全角字母/数字/标点（FF00 区段）统一成半角
     seq = unicodedata.normalize("NFKC", key_seq)
     cjk_map = {
-        "。": ".", "、": ",", "—": "-", "…": ".",
+        "。": ".", "、": "/", "—": "-", "…": ".",
         "「": "[", "」": "]", "『": "[", "』": "]",
         "《": "<", "》": ">", "·": "`",
     }
@@ -1055,6 +1064,7 @@ class IMSchemasPlugin(Star):
         fonts_char = _load_fonts(80)
         fonts_info = _load_fonts(18)
         fonts_dafa = _load_fonts(16)
+        fonts_dafa_sel = _load_fonts(18)  # 选重码略大一号，更显眼
 
         probe = Image.new("RGB", (1, 1))
         pdraw = ImageDraw.Draw(probe)
@@ -1063,23 +1073,27 @@ class IMSchemasPlugin(Star):
             return self._measure(pdraw, text, fonts)
 
         # Build 打法 string
-        # 同时构造分段着色列表：每条候选可能是选重（红色）或普通（默认）
+        # 同时构造分段着色 / 字体列表：每条候选可能是选重（红色 + 略大粗体）或普通
         DEFAULT_COLOR = (40, 40, 40)
         SELECT_COLOR = (200, 40, 40)
         dafa_parts = []
-        dafa_pieces: list[tuple[str, tuple[int, int, int]]] = []
+        # 每段：(text, color, fonts, stroke_width)
+        dafa_pieces: list[tuple[str, tuple[int, int, int], tuple, int]] = []
         SEP = "  "
         for idx, (code, pos) in enumerate(codes_with_pos):
             piece = f"{code}({pos})"
             dafa_parts.append(piece)
             if idx > 0:
-                dafa_pieces.append((SEP, DEFAULT_COLOR))
-            dafa_pieces.append((piece, SELECT_COLOR if pos > 1 else DEFAULT_COLOR))
+                dafa_pieces.append((SEP, DEFAULT_COLOR, fonts_dafa, 0))
+            if pos > 1:
+                dafa_pieces.append((piece, SELECT_COLOR, fonts_dafa_sel, 1))
+            else:
+                dafa_pieces.append((piece, DEFAULT_COLOR, fonts_dafa, 0))
         dafa_str = SEP.join(dafa_parts)
         if codes_with_pos:
             tail = f"{SEP}共{len(codes_with_pos)}个"
             dafa_str += tail
-            dafa_pieces.append((tail, DEFAULT_COLOR))
+            dafa_pieces.append((tail, DEFAULT_COLOR, fonts_dafa, 0))
 
         missing_placeholder = "??????"
         char_w, char_gh, char_bot = msr(word, fonts_char)
@@ -1089,7 +1103,20 @@ class IMSchemasPlugin(Star):
         i2w, i2gh, _ = msr(info2, fonts_info)
         dafa_label = "打法:"
         dlw, dlgh, dlbot = msr(dafa_label, fonts_info)
-        dfw, dfgh, dfbot = msr(dafa_str if dafa_str else missing_placeholder, fonts_dafa)
+        # 打法行整体度量：选重段用 fonts_dafa_sel（更大），普通段用 fonts_dafa
+        if dafa_pieces:
+            dfw = 0
+            dfbot = 0
+            piece_widths: list[int] = []
+            for piece, _color, pfonts, _sw in dafa_pieces:
+                pw, _, pbot = msr(piece, pfonts)
+                piece_widths.append(pw)
+                dfw += pw
+                if pbot > dfbot:
+                    dfbot = pbot
+        else:
+            piece_widths = []
+            dfw, _, dfbot = msr(missing_placeholder, fonts_dafa)
 
         # info block height (glyph heights + gap)
         info_block_h = i1gh + 8 + i2gh
@@ -1118,10 +1145,15 @@ class IMSchemasPlugin(Star):
         _render_text_with_fallback(draw, (PAD, y), dafa_label, fonts_info, (80, 80, 80))
         y += dlbot + 8
         if dafa_str:
+            # 共享基线：用最大字号的 ascent 作为基线锚点，混排不同字号也对齐
+            ref_asc = max(_ref_ascent(p[2]) for p in dafa_pieces)
+            shared_baseline = y + ref_asc
             x = PAD + 8
-            for piece, color in dafa_pieces:
-                _render_text_with_fallback(draw, (x, y), piece, fonts_dafa, color)
-                pw, _, _ = msr(piece, fonts_dafa)
+            for (piece, color, pfonts, sw), pw in zip(dafa_pieces, piece_widths):
+                _render_text_with_fallback(
+                    draw, (x, y), piece, pfonts, color,
+                    stroke_width=sw, baseline=shared_baseline,
+                )
                 x += pw
         else:
             _render_text_with_fallback(draw, (PAD + 8, y), missing_placeholder, fonts_dafa, (180, 60, 220))
@@ -1136,7 +1168,7 @@ class IMSchemasPlugin(Star):
         origin: tuple[int, int],
         counts: dict[str, int],
     ) -> None:
-        """在 origin 处绘制一个 12 列宽的 QWERTY 键盘热力图。
+        """在 origin 处绘制一个 13 列宽的 QWERTY 键盘热力图。
         色阶：未按 → 浅灰；按下 → 浅黄到深红的线性渐变（按 max(counts) 归一化）。"""
         x0, y0 = origin
         max_n = max(counts.values(), default=0)
@@ -1201,9 +1233,10 @@ class IMSchemasPlugin(Star):
     ) -> bytes:
         PAD = 24
         CELL_GAP = 16
-        fonts_stats = _load_fonts(18)
+        fonts_stats = _load_fonts(28)
         fonts_char = _load_fonts(36)
-        fonts_code = _load_fonts(16)
+        fonts_code = _load_fonts(28)
+        fonts_code_sel = _load_fonts(30)  # 选重码略大一号，更显眼
 
         probe = Image.new("RGB", (1, 1))
         pdraw = ImageDraw.Draw(probe)
@@ -1255,14 +1288,18 @@ class IMSchemasPlugin(Star):
         line1 = f"难度: {difficulty}({diff_score})"
         line2 = f"【{schema_name}】"
         eq_str = f"{equivalence:.6f}" if equivalence is not None else "--"
-        line3 = f"来源: {owner_id}    码长: {avg_len:.6f}    当量: {eq_str}"
-        line4 = f"字数: {len(chars)}    选重: {sel_count}    缺字: {missing}"
+        line3 = f"来源: {owner_id}        字数: {len(chars)}        缺字: {missing}"
+        line4 = f"码长: {avg_len:.6f}        选重: {sel_count}        当量: {eq_str}"
 
         _, sgh, sbot = msr("难度: A", fonts_stats)
         _, char_gh, char_bot = msr("我", fonts_char)
         _, code_gh, code_bot = msr("abc", fonts_code)
+        _, _, code_sel_bot = msr("abc", fonts_code_sel)
+        # 行高用更大的那一个，避免选重码下沿被裁
+        code_row_bot = max(code_bot, code_sel_bot)
 
         # Per-cell 宽度：max(段文字宽度, 段编码宽度) + CELL_GAP
+        # 选重段的编码用 fonts_code_sel 测量（更宽一点）
         cell_widths = []
         for i, seg in enumerate(segments):
             cw, _, _ = msr(seg.text, fonts_char)
@@ -1270,11 +1307,14 @@ class IMSchemasPlugin(Star):
             if cs is None:
                 codew, _, _ = msr("??????", fonts_code)
             else:
-                codew, _, _ = msr(cs, fonts_code)
+                is_sel_cell = (
+                    not seg.is_self_coded and not seg.is_missing and seg.pos > 1
+                )
+                codew, _, _ = msr(cs, fonts_code_sel if is_sel_cell else fonts_code)
             cell_widths.append(max(cw, codew) + CELL_GAP)
 
         stats_w = max(msr(l, fonts_stats)[0] for l in [line1, line2, line3, line4])
-        MAX_IMG_W = 1600
+        MAX_IMG_W = 1200
         content_w = sum(cell_widths)
         STATS_KB_GAP = 24
         top_w = (stats_w + STATS_KB_GAP + _KEYBOARD_W) if show_keyboard else stats_w
@@ -1300,7 +1340,7 @@ class IMSchemasPlugin(Star):
         STATS_H = LINE_H * 4
         UL_GAP = 4
         CODE_GAP = 5
-        ROW_H = char_bot + UL_GAP + 1 + CODE_GAP + code_bot
+        ROW_H = char_bot + UL_GAP + 1 + CODE_GAP + code_row_bot
         ROW_GAP = 12
         # 顶部带键盘时，留下 stats 和键盘里更高的那个
         top_block_h = max(STATS_H, _KEYBOARD_H) if show_keyboard else STATS_H
@@ -1350,7 +1390,9 @@ class IMSchemasPlugin(Star):
                     is_self = seg.is_self_coded
                     is_select = (not is_self) and seg.pos > 1
                     is_phrase = (not is_self) and len(seg.text) > 1
-                codew, _, _ = msr(code_str, fonts_code)
+                code_fonts = fonts_code_sel if is_select else fonts_code
+                code_stroke = 1 if is_select else 0
+                codew, _, _ = msr(code_str, code_fonts)
 
                 if is_missing:
                     char_color = (180, 60, 220)
@@ -1375,7 +1417,7 @@ class IMSchemasPlugin(Star):
                     code_color = (200, 40, 40)
                 else:
                     char_color = (30, 30, 30)
-                    code_color = (80, 80, 80)
+                    code_color = (10, 10, 10)
 
                 char_x = x + (cell_w - cw) // 2
                 _render_text_with_fallback(draw, (char_x, char_y), seg.text, fonts_char, char_color)
@@ -1383,7 +1425,10 @@ class IMSchemasPlugin(Star):
                 draw.line([(x, ul_y), (x + cell_w, ul_y)], fill=(140, 140, 140), width=1)
 
                 code_x = x + (cell_w - codew) // 2
-                _render_text_with_fallback(draw, (code_x, code_y), code_str, fonts_code, code_color)
+                _render_text_with_fallback(
+                    draw, (code_x, code_y), code_str, code_fonts, code_color,
+                    stroke_width=code_stroke,
+                )
 
                 x += cell_widths[i]
 
@@ -1399,7 +1444,7 @@ class IMSchemasPlugin(Star):
         title 不再回显查询原文，避免冗长。"""
         chars = list(word)
         difficulty, diff_score = _text_difficulty(chars)
-        info = f"字数: {len(chars)}    难度: {difficulty}({diff_score})    （{n_schemas} 个方案）"
+        info = f"字数: {len(chars)}        难度: {difficulty}({diff_score})        （{n_schemas} 个方案）"
         if race_header:
             return f"{race_header}\n{info}"
         return info
@@ -1631,7 +1676,7 @@ class IMSchemasPlugin(Star):
         SEP = "　"
 
         # 估算图宽：取 title / 各 code 头 / 各 word 行的最大宽度
-        MAX_IMG_W = 1600
+        MAX_IMG_W = 1200
         widest = msr(title, fonts_title)[0]
         for c in uniq_codes:
             words = lookup.get(c, [])
@@ -1766,7 +1811,7 @@ class IMSchemasPlugin(Star):
         items = [f"{name}（{owner}）" for name, owner in schemas]
         sep = "、"
 
-        MAX_IMG_W = 1600
+        MAX_IMG_W = 1200
         tw, _, tbot = msr(title, fonts_title)
         IMG_W = max(min(PAD * 2 + max((msr(it + sep, fonts_body)[0] for it in items), default=0), MAX_IMG_W),
                     PAD * 2 + tw, 400)
