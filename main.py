@@ -1,5 +1,7 @@
+import json
 import re
 import sqlite3
+import string
 import unicodedata
 from functools import lru_cache
 from io import BytesIO
@@ -176,16 +178,121 @@ def _char_difficulty(ch: str) -> int:
     return 0
 
 
-def _text_difficulty(chars: list[str]) -> tuple[str, int]:
-    score = sum(_char_difficulty(ch) for ch in chars if not _is_passthrough(ch))
-    if score == 0:
+_RANK_DATA_DIR = Path(__file__).parent / "rank_data"
+_RANK_LETTER_DIGIT = string.ascii_letters + string.digits
+_RANK_PUNCT_KEEP = set(":,.;!'\"")
+
+
+def _load_rank_data() -> tuple[dict, set, set]:
+    """加载难度测算所需的三份语料：词频表 / 有效字符集 / 词组前缀集。
+    缺失或损坏时返回空容器，调用方会退化为分数 -1（与原算法异常分支一致）。"""
+    try:
+        with open(_RANK_DATA_DIR / "zongCiPin.json", encoding="utf-8") as f:
+            zong = json.load(f)
+        with open(_RANK_DATA_DIR / "validChar.json", encoding="utf-8") as f:
+            valid = set(json.load(f).get("k", []))
+        with open(_RANK_DATA_DIR / "pre.json", encoding="utf-8") as f:
+            pre = set(json.load(f).get("k", []))
+        return zong, valid, pre
+    except (OSError, ValueError) as e:
+        logger.warning(f"[im_schemas] 难度测算数据加载失败: {e}")
+        return {}, set(), set()
+
+
+_RANK_ZONG_CIPIN, _RANK_VALID_CHAR, _RANK_PRE = _load_rank_data()
+
+
+def _text_difficulty(chars: list[str]) -> tuple[str, object]:
+    """依据「字根月饼」的 rank 算法测算文本难度。
+    返回 (难度等级中文, 分数)；分数 >100 时返回字符串「爆表」。
+    数据缺失或异常时返回 ("--", -1)。"""
+    if not _RANK_VALID_CHAR or not _RANK_ZONG_CIPIN:
+        return "--", -1
+
+    s = "".join(chars).strip()
+    # 过滤无效字符：空格仅在英数之间保留；西文标点仅在紧贴英数时保留
+    ns_chars: list[str] = []
+    for pos, c in enumerate(s):
+        if c in _RANK_VALID_CHAR:
+            ns_chars.append(c)
+            continue
+        if (c == " "
+                and 0 < pos < len(s) - 1
+                and s[pos - 1] in _RANK_LETTER_DIGIT
+                and s[pos + 1] in _RANK_LETTER_DIGIT):
+            ns_chars.append(c)
+            continue
+        if c in _RANK_PUNCT_KEEP and (
+            (pos > 0 and s[pos - 1] in _RANK_LETTER_DIGIT)
+            or (pos < len(s) - 1 and s[pos + 1] in _RANK_LETTER_DIGIT)
+        ):
+            ns_chars.append(c)
+    s = "".join(ns_chars)
+    if not s:
+        return "--", -1
+
+    n = len(s)
+    # dp[i] = (累计码长, 词数, 上一切点)，最少码长优先；同码长按词数最少
+    NEG = (-1, -1, -1)
+    dp: list[tuple[int, int, int]] = [NEG] * (n + 1)
+    dp[0] = (0, 0, -1)
+
+    for pos in range(n):
+        cur_len = 1
+        while pos + cur_len <= n:
+            w = s[pos:pos + cur_len]
+            in_zong = w in _RANK_ZONG_CIPIN
+            if cur_len == 1 or in_zong:
+                wl = _RANK_ZONG_CIPIN[w][-1] if in_zong else 1
+                new_pos = pos + cur_len
+                tar = dp[new_pos]
+                base = dp[pos]
+                new_code_len = base[0] + wl
+                new_word_cnt = base[1] + 1
+                if (tar[0] == -1 or tar[0] > new_code_len
+                        or (tar[0] == new_code_len and tar[1] > new_word_cnt)):
+                    dp[new_pos] = (new_code_len, new_word_cnt, pos)
+            if w in _RANK_PRE:
+                cur_len += 1
+            else:
+                break
+
+    if dp[n][0] == -1:
+        return "--", -1
+
+    water = 1.0
+    hard = 0.0
+    cur_pos = n
+    while cur_pos != 0:
+        pre_pos = dp[cur_pos][2]
+        if pre_pos < 0:
+            break
+        w = s[pre_pos:cur_pos]
+        if w in _RANK_ZONG_CIPIN:
+            freq = _RANK_ZONG_CIPIN[w][0]
+            if len(w) == 1:
+                hard += min(10, pow(freq, 1.5) / 100000)
+            else:
+                water += 2000 / (freq + 2000)
+        cur_pos = pre_pos
+
+    score = round(hard / water, 2)
+
+    if score < 0.1:
         label = "淼"
-    elif score <= 2:
+    elif score < 0.3:
+        label = "水"
+    elif score < 0.8:
         label = "易"
-    elif score <= 5:
-        label = "中"
-    else:
+    elif score < 5:
+        label = "普"
+    elif score < 15:
         label = "难"
+    else:
+        label = "虐"
+
+    if score > 100:
+        return label, "爆表"
     return label, score
 
 
@@ -705,6 +812,29 @@ class IMSchemasPlugin(Star):
             result.append((code, pos))
         return result
 
+    def _lookup_by_code(
+        self, schema_name: str, codes: list[str]
+    ) -> dict[str, list[str]]:
+        """精确反查：每个唯一 code → 该 code 下所有字词（按 rowid，即码表录入顺序）。
+        与上屏位序对齐：列表第 i 项的位序为 i+1。"""
+        unique_codes = list({c for c in codes if c})
+        if not unique_codes:
+            return {}
+        conn = _open_db()
+        out: dict[str, list[str]] = {c: [] for c in unique_codes}
+        CHUNK = 500
+        for i in range(0, len(unique_codes), CHUNK):
+            batch = unique_codes[i:i + CHUNK]
+            placeholders = ",".join("?" * len(batch))
+            rows = conn.execute(
+                f"SELECT code, word FROM codes WHERE schema_name = ? AND code IN ({placeholders}) ORDER BY rowid",
+                (schema_name, *batch),
+            ).fetchall()
+            for code, word in rows:
+                out[code].append(word)
+        conn.close()
+        return out
+
     def _list_all_schemas(self) -> list[tuple[str, str]]:
         """返回所有词提的 (name, owner_id) 列表，按 name 字典序。"""
         conn = _open_db()
@@ -1001,7 +1131,7 @@ class IMSchemasPlugin(Star):
                 cell_codes.append(None)
             elif seg.is_self_coded:
                 per_presses.append(1)
-                cell_codes.append(seg.text)
+                cell_codes.append("＿" if seg.text == " " else seg.text)
                 key_seq_parts.append(seg.text)
             else:
                 code, pos = seg.code, seg.pos
@@ -1301,6 +1431,167 @@ class IMSchemasPlugin(Star):
         img.save(buf, format="PNG")
         return buf.getvalue()
 
+    def _make_reverse_image(
+        self,
+        schema_name: str,
+        codes: list[str],
+        owner_id: str,
+        select_keys: str,
+    ) -> bytes:
+        """编码反查图：列出每个 code 在该方案下对应的字词，按 rowid 顺序给出位序。
+        位序 1（首选）默认色，位序 ≥2（选重）用红色与正常查询一致。"""
+        PAD = 24
+        LINE_GAP = 6
+        BLOCK_GAP = 18
+        fonts_title = _load_fonts(20)
+        fonts_code = _load_fonts(26)
+        fonts_word = _load_fonts(22)
+        fonts_info = _load_fonts(16)
+
+        probe = Image.new("RGB", (1, 1))
+        pdraw = ImageDraw.Draw(probe)
+
+        def msr(text, fonts):
+            return self._measure(pdraw, text, fonts)
+
+        # 去重保序
+        seen: set[str] = set()
+        uniq_codes: list[str] = []
+        for c in codes:
+            if c and c not in seen:
+                uniq_codes.append(c)
+                seen.add(c)
+
+        lookup = self._lookup_by_code(schema_name, uniq_codes)
+
+        title = f"【{schema_name}】反查　来源: {owner_id}"
+        _, _, tbot = msr(title, fonts_title)
+
+        DEFAULT_COLOR = (40, 40, 40)
+        SELECT_COLOR = (200, 40, 40)
+        HEAD_COLOR = (30, 30, 30)
+        MISS_COLOR = (180, 60, 220)
+        INFO_COLOR = (120, 120, 120)
+        SEP = "　"
+
+        # 估算图宽：取 title / 各 code 头 / 各 word 行的最大宽度
+        MAX_IMG_W = 900
+        widest = msr(title, fonts_title)[0]
+        for c in uniq_codes:
+            words = lookup.get(c, [])
+            head_text = f"{c}　共 {len(words)} 个" if words else f"{c}　（未命中）"
+            widest = max(widest, msr(head_text, fonts_code)[0])
+            if words:
+                # 不强求单行容纳全部字词；只保证最长单个 piece 能放下
+                for i, w in enumerate(words, 1):
+                    pw, _, _ = msr(f"{i}.{w}", fonts_word)
+                    widest = max(widest, pw + 16)
+        IMG_W = max(min(MAX_IMG_W, PAD * 2 + widest), 400)
+        avail_w = IMG_W - PAD * 2 - 8
+
+        # 排版：把每个 code 块切成若干行，行内是 (text, color) 段
+        Row = list[tuple[str, tuple[int, int, int]]]
+        blocks: list[tuple[str, str, tuple[int, int, int], list[Row]]] = []
+        for c in uniq_codes:
+            words = lookup.get(c, [])
+            if not words:
+                head_suffix, suffix_color = "（未命中）", MISS_COLOR
+                rows: list[Row] = []
+            else:
+                head_suffix, suffix_color = f"共 {len(words)} 个", INFO_COLOR
+                rows = []
+                cur: Row = []
+                cur_w = 0
+                sep_w = msr(SEP, fonts_word)[0]
+                for i, w in enumerate(words, 1):
+                    color = SELECT_COLOR if i > 1 else DEFAULT_COLOR
+                    piece = f"{i}.{w}"
+                    pw, _, _ = msr(piece, fonts_word)
+                    add_w = (sep_w if cur else 0) + pw
+                    if cur and cur_w + add_w > avail_w:
+                        rows.append(cur)
+                        cur = [(piece, color)]
+                        cur_w = pw
+                    else:
+                        if cur:
+                            cur.append((SEP, DEFAULT_COLOR))
+                            cur_w += sep_w
+                        cur.append((piece, color))
+                        cur_w += pw
+                if cur:
+                    rows.append(cur)
+            blocks.append((c, head_suffix, suffix_color, rows))
+
+        _, _, code_bot = msr("a", fonts_code)
+        _, _, word_bot = msr("我", fonts_word)
+        _, _, info_bot = msr("a", fonts_info)
+
+        IMG_H = PAD + tbot + 16
+        for _c, _suf, _sc, rows in blocks:
+            IMG_H += code_bot + 4
+            for _ in rows:
+                IMG_H += word_bot + LINE_GAP
+            IMG_H += BLOCK_GAP
+        if blocks:
+            IMG_H -= BLOCK_GAP
+        IMG_H += PAD
+
+        img = Image.new("RGB", (IMG_W, IMG_H), (255, 255, 255))
+        draw = ImageDraw.Draw(img)
+
+        _render_text_with_fallback(draw, (PAD, PAD), title, fonts_title, HEAD_COLOR)
+        y = PAD + tbot + 16
+
+        for c, suffix, suffix_color, rows in blocks:
+            _render_text_with_fallback(draw, (PAD, y), c, fonts_code, HEAD_COLOR)
+            hw, _, _ = msr(c, fonts_code)
+            _render_text_with_fallback(
+                draw, (PAD + hw + 12, y + (code_bot - info_bot)),
+                suffix, fonts_info, suffix_color,
+            )
+            y += code_bot + 4
+            for row in rows:
+                x = PAD + 16
+                for piece, color in row:
+                    _render_text_with_fallback(draw, (x, y), piece, fonts_word, color)
+                    pw, _, _ = msr(piece, fonts_word)
+                    x += pw
+                y += word_bot + LINE_GAP
+            y += BLOCK_GAP
+
+        buf = BytesIO()
+        img.save(buf, format="PNG")
+        return buf.getvalue()
+
+    def _make_reverse_all_image(
+        self, codes: list[str], schema_names: list[str]
+    ) -> bytes:
+        """all 组反查：为每个方案生成反查图，竖向拼接。"""
+        sub_imgs: list[Image.Image] = []
+        for name in schema_names:
+            info = self._schema_info(name)
+            if not info:
+                continue
+            png = self._make_reverse_image(
+                name, codes, info["owner_id"], info["select_keys"]
+            )
+            sub_imgs.append(Image.open(BytesIO(png)).convert("RGB"))
+
+        if not sub_imgs:
+            return self._make_all_empty_image(" ".join(codes))
+
+        GAP = 16
+        IMG_W = max(im.width for im in sub_imgs)
+        IMG_H = sum(im.height for im in sub_imgs) + GAP * (len(sub_imgs) - 1)
+        canvas = Image.new("RGB", (IMG_W, IMG_H), (255, 255, 255))
+        y = 0
+        for im in sub_imgs:
+            canvas.paste(im, (0, y))
+            y += im.height + GAP
+        buf = BytesIO()
+        canvas.save(buf, format="PNG")
+        return buf.getvalue()
+
     def _make_schemas_list_image(self, schemas: list[tuple[str, str]]) -> bytes:
         """渲染所有词提名图片：首行统计，正文为「词提名（来源）、…」自动换行。"""
         PAD = 24
@@ -1551,6 +1842,30 @@ class IMSchemasPlugin(Star):
 
         rest_tokens = rest.split() if rest else []
 
+        # 编码反查：/[词提名] <code1> <code2> …，或 /[all触发词] <code1> <code2> …
+        # head 以 `/` 开头即视为反查触发；剥离 `/` 后再走 force_single 前缀剥离与词提名校验。
+        if head.startswith("/") and len(head) > 1:
+            rev_name, _ = _strip_force_prefix(head[1:])
+            is_all = self._is_all_trigger(rev_name)
+            if (is_all or self._schema_exists(rev_name)) and rest_tokens:
+                try:
+                    if is_all:
+                        schema_names = self._all_group_schemas()
+                        img_bytes = self._make_reverse_all_image(rest_tokens, schema_names)
+                    else:
+                        info = self._schema_info(rev_name)
+                        img_bytes = self._make_reverse_image(
+                            rev_name, rest_tokens, info["owner_id"], info["select_keys"]
+                        )
+                except Exception as e:
+                    logger.exception(f"[im_schemas] 生成反查图片失败: {e}")
+                    yield event.plain_result(
+                        f"反查「{' '.join(rest_tokens)}」时渲染图片失败。"
+                    )
+                    return
+                yield event.chain_result([AstrImage.fromBytes(img_bytes)])
+                return
+
         # 多词提对比：head 与 rest_tokens 全部为已知词提名（或 all 触发词，允许各自带 ! 前缀），
         # 且消息引用了文本，视作一次性 all 组对比，仅渲染用户列出的这几套词提。
         # 任一 token 带 ! 前缀，都对整组生效（force_single）。
@@ -1587,10 +1902,8 @@ class IMSchemasPlugin(Star):
                 yield event.chain_result([AstrImage.fromBytes(img_bytes)])
                 return
 
-        # 未进入多词提对比，回到 [词提名] <字词> 形态：rest 必须是单 token 才视作 word
-        if len(rest_tokens) > 1:
-            return
-        word = rest_tokens[0] if rest_tokens else None
+        # 未进入多词提对比，回到 [词提名] <字词> 形态：rest 整段作查询字词（允许含空格）
+        word = rest if rest else None
 
         # all 组：聚合多个方案的结果
         if self._is_all_trigger(schema_name):
