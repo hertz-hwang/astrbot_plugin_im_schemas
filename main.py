@@ -1670,12 +1670,12 @@ class IMSchemasPlugin(Star):
         await event.send(
             event.plain_result(
                 "文件已收到。请引用回复上方文件消息，并发送：\n"
-                "/上传词提 [词提名]\n\n"
+                "bot上传词提 [词提名]\n\n"
                 "可附加参数（空格分隔，均可省略）：\n"
                 "  选重键=_;'4567890\n"
                 "  最大长度=4\n"
                 "  标点引导键=\n\n"
-                "示例：/上传词提 五笔86 选重键=_;' 最大长度=4"
+                "示例：bot上传词提 五笔86 选重键=_;' 最大长度=4"
             )
         )
         event.stop_event()
@@ -1686,11 +1686,11 @@ class IMSchemasPlugin(Star):
     async def cmd_upload(self, event: AstrMessageEvent):
         """
         用法：引用回复码表文件消息，发送
-          /上传词提 [词提名] [选重键=...] [最大长度=N] [标点引导键=...]
+          bot上传词提 [词提名] [选重键=...] [最大长度=N] [标点引导键=...]
         """
         args_str = event.message_str.strip()
         if not args_str:
-            yield event.plain_result("用法：/上传词提 [词提名] [选重键=...] [最大长度=N] [标点引导键=...]")
+            yield event.plain_result("用法：bot上传词提 [词提名] [选重键=...] [最大长度=N] [标点引导键=...]")
             return
 
         # 解析词提名（第一个 token）和可选参数
@@ -1699,7 +1699,7 @@ class IMSchemasPlugin(Star):
         if tokens and tokens[0] == "上传词提":
             tokens = tokens[1:]
         if not tokens:
-            yield event.plain_result("用法：/上传词提 [词提名] [选重键=...] [最大长度=N] [标点引导键=...]")
+            yield event.plain_result("用法：bot上传词提 [词提名] [选重键=...] [最大长度=N] [标点引导键=...]")
             return
         schema_name = tokens[0]
         if len(schema_name) <= 1:
@@ -1844,27 +1844,31 @@ class IMSchemasPlugin(Star):
 
         # 编码反查：/[词提名] <code1> <code2> …，或 /[all触发词] <code1> <code2> …
         # head 以 `/` 开头即视为反查触发；剥离 `/` 后再走 force_single 前缀剥离与词提名校验。
-        if head.startswith("/") and len(head) > 1:
-            rev_name, _ = _strip_force_prefix(head[1:])
-            is_all = self._is_all_trigger(rev_name)
-            if (is_all or self._schema_exists(rev_name)) and rest_tokens:
-                try:
-                    if is_all:
-                        schema_names = self._all_group_schemas()
-                        img_bytes = self._make_reverse_all_image(rest_tokens, schema_names)
-                    else:
-                        info = self._schema_info(rev_name)
-                        img_bytes = self._make_reverse_image(
-                            rev_name, rest_tokens, info["owner_id"], info["select_keys"]
+        # 注意：`/` 也是 AstrBot 的指令前缀，凡是以 `/` 开头的消息一律不再走通用查询，
+        # 让 filter.command 注册的指令（如 /上传词提、/删除词提）自行处理，避免抢答。
+        if head.startswith("/"):
+            if len(head) > 1:
+                rev_name, _ = _strip_force_prefix(head[1:])
+                is_all = self._is_all_trigger(rev_name)
+                if (is_all or self._schema_exists(rev_name)) and rest_tokens:
+                    try:
+                        if is_all:
+                            schema_names = self._all_group_schemas()
+                            img_bytes = self._make_reverse_all_image(rest_tokens, schema_names)
+                        else:
+                            info = self._schema_info(rev_name)
+                            img_bytes = self._make_reverse_image(
+                                rev_name, rest_tokens, info["owner_id"], info["select_keys"]
+                            )
+                    except Exception as e:
+                        logger.exception(f"[im_schemas] 生成反查图片失败: {e}")
+                        yield event.plain_result(
+                            f"反查「{' '.join(rest_tokens)}」时渲染图片失败。"
                         )
-                except Exception as e:
-                    logger.exception(f"[im_schemas] 生成反查图片失败: {e}")
-                    yield event.plain_result(
-                        f"反查「{' '.join(rest_tokens)}」时渲染图片失败。"
-                    )
+                        return
+                    yield event.chain_result([AstrImage.fromBytes(img_bytes)])
                     return
-                yield event.chain_result([AstrImage.fromBytes(img_bytes)])
-                return
+            return
 
         # 多词提对比：head 与 rest_tokens 全部为已知词提名（或 all 触发词，允许各自带 ! 前缀），
         # 且消息引用了文本，视作一次性 all 组对比，仅渲染用户列出的这几套词提。
@@ -1987,7 +1991,7 @@ class IMSchemasPlugin(Star):
         if schema_name.startswith("删除词提"):
             schema_name = schema_name[len("删除词提"):].strip()
         if not schema_name:
-            yield event.plain_result("用法：/删除词提 [词提名]")
+            yield event.plain_result("用法：bot删除词提 [词提名]")
             return
         owner = self._schema_owner(schema_name)
         if owner is None:
