@@ -441,7 +441,7 @@ def _build_key_counts(key_seq: str) -> dict[str, int]:
     seq = unicodedata.normalize("NFKC", key_seq)
     cjk_map = {
         "。": ".", "、": "/", "—": "-", "…": ".",
-        "「": "[", "」": "]", "『": "[", "』": "]",
+        "「": "[", "」": "]", "『": "[", "』": "]", "【": "[", "】": "]",
         "《": "<", "》": ">", "·": "`",
     }
     counts: dict[str, int] = {}
@@ -587,22 +587,22 @@ class IMSchemasPlugin(Star):
         name: str,
         owner_id: str,
         entries: list[tuple[str, str]],
-        select_keys: str,
-        max_len: int,
-        punct_key: str,
     ) -> int:
+        """导入或刷新词提的码表条目。
+
+        词提首次创建时使用默认 select_keys / max_len / punct_key；
+        若同名词提已存在，仅刷新 owner_id 与码表条目，
+        保留用户先前通过「设置词提」配置的三项参数。
+        """
         conn = _open_db()
         conn.execute(
             """
             INSERT INTO schemas(name, owner_id, select_keys, max_len, punct_key)
             VALUES (?, ?, ?, ?, ?)
             ON CONFLICT(name) DO UPDATE SET
-                owner_id    = excluded.owner_id,
-                select_keys = excluded.select_keys,
-                max_len     = excluded.max_len,
-                punct_key   = excluded.punct_key
+                owner_id = excluded.owner_id
             """,
-            (name, owner_id, select_keys, max_len, punct_key),
+            (name, owner_id, DEFAULT_SELECT_KEYS, DEFAULT_MAX_LEN, ""),
         )
         conn.execute("DELETE FROM codes WHERE schema_name = ?", (name,))
         conn.executemany(
@@ -617,6 +617,18 @@ class IMSchemasPlugin(Star):
         conn.execute("PRAGMA incremental_vacuum")
         conn.close()
         return count
+
+    def _update_schema_setting(self, name: str, field: str, value) -> None:
+        """更新单个词提配置字段（select_keys / max_len / punct_key）。"""
+        if field not in ("select_keys", "max_len", "punct_key"):
+            raise ValueError(f"unsupported schema field: {field}")
+        conn = _open_db()
+        conn.execute(
+            f"UPDATE schemas SET {field} = ? WHERE name = ?",
+            (value, name),
+        )
+        conn.commit()
+        conn.close()
 
     def _delete_schema(self, name: str) -> None:
         conn = _open_db()
@@ -2009,11 +2021,11 @@ class IMSchemasPlugin(Star):
             event.plain_result(
                 "文件已收到。请引用回复上方文件消息，并发送：\n"
                 "khkh上传词提 [词提名]\n\n"
-                "可附加参数（空格分隔，均可省略）：\n"
-                "  选重键=_;'4567890\n"
-                "  最大长度=4\n"
-                "  标点引导键=\n\n"
-                "示例：khkh上传词提 五笔86 选重键=_;' 最大长度=4"
+                "示例：khkh上传词提 五笔86\n\n"
+                "首次上传后，可单独设置以下参数（不会被后续重新上传重置）：\n"
+                "  khkh设置词提 [词提名] 选重键=_;'4567890\n"
+                "  khkh设置词提 [词提名] 最大长度=4\n"
+                "  khkh设置词提 [词提名] 标点引导键=/"
             )
         )
         event.stop_event()
@@ -2024,40 +2036,30 @@ class IMSchemasPlugin(Star):
     async def cmd_upload(self, event: AstrMessageEvent):
         """
         用法：引用回复码表文件消息，发送
-          khkh上传词提 [词提名] [选重键=...] [最大长度=N] [标点引导键=...]
+          khkh上传词提 [词提名]
         """
         args_str = event.message_str.strip()
         if not args_str:
-            yield event.plain_result("用法：khkh上传词提 [词提名] [选重键=...] [最大长度=N] [标点引导键=...]")
+            yield event.plain_result("用法：khkh上传词提 [词提名]")
             return
 
-        # 解析词提名（第一个 token）和可选参数
+        # 解析词提名（第一个 token），event.message_str 包含指令前缀，跳过它
         tokens = args_str.split()
-        # event.message_str 包含指令前缀，跳过它
         if tokens and tokens[0] == "上传词提":
             tokens = tokens[1:]
         if not tokens:
-            yield event.plain_result("用法：khkh上传词提 [词提名] [选重键=...] [最大长度=N] [标点引导键=...]")
+            yield event.plain_result("用法：khkh上传词提 [词提名]")
+            return
+        if len(tokens) > 1:
+            yield event.plain_result(
+                "上传词提仅接受词提名一个参数。\n"
+                "请使用「khkh设置词提 [词提名] 选重键=…/最大长度=…/标点引导键=…」单独设置。"
+            )
             return
         schema_name = tokens[0]
         if len(schema_name) <= 1:
             yield event.plain_result("词提名不能为单个字符，请使用至少两个字符的名称。")
             return
-        select_keys = DEFAULT_SELECT_KEYS
-        max_len = DEFAULT_MAX_LEN
-        punct_key = ""
-
-        for tok in tokens[1:]:
-            if tok.startswith("选重键="):
-                select_keys = tok[4:]
-            elif tok.startswith("最大长度="):
-                try:
-                    max_len = int(tok[5:])
-                except ValueError:
-                    yield event.plain_result("最大长度必须为整数。")
-                    return
-            elif tok.startswith("标点引导键="):
-                punct_key = tok[6:]
 
         # 从引用回复中找 File
         chain = event.get_messages()
@@ -2113,9 +2115,7 @@ class IMSchemasPlugin(Star):
                 )
                 return
 
-        count = self._import_schema(
-            schema_name, user_id, entries, select_keys, max_len, punct_key
-        )
+        count = self._import_schema(schema_name, user_id, entries)
         yield event.plain_result(
             f"词提「{schema_name}」导入成功！共 {count:,} 条编码。\n"
             f"查询：{schema_name} <字词>\n"
@@ -2343,6 +2343,73 @@ class IMSchemasPlugin(Star):
             return
         yield event.chain_result([AstrImage.fromBytes(img_bytes)])
 
+    # ── 设置词提 ────────────────────────────────────────────────────────────
+
+    @filter.command("设置词提")
+    async def cmd_settings(self, event: AstrMessageEvent):
+        """
+        用法：khkh设置词提 [词提名] 选重键=...
+              khkh设置词提 [词提名] 最大长度=N
+              khkh设置词提 [词提名] 标点引导键=...
+
+        每次仅修改一项，未设置的项保持原值。
+        """
+        usage = (
+            "用法：khkh设置词提 [词提名] 选重键=...\n"
+            "      khkh设置词提 [词提名] 最大长度=N\n"
+            "      khkh设置词提 [词提名] 标点引导键=..."
+        )
+        args_str = event.message_str.strip()
+        if args_str.startswith("设置词提"):
+            args_str = args_str[len("设置词提"):].strip()
+        if not args_str:
+            yield event.plain_result(usage)
+            return
+
+        tokens = args_str.split(maxsplit=1)
+        if len(tokens) < 2:
+            yield event.plain_result(usage)
+            return
+        schema_name, kv = tokens[0], tokens[1].strip()
+
+        if "=" not in kv:
+            yield event.plain_result(usage)
+            return
+        key, value = kv.split("=", 1)
+        key = key.strip()
+
+        owner = self._schema_owner(schema_name)
+        if owner is None:
+            yield event.plain_result(f"词提「{schema_name}」不存在。")
+            return
+        user_id = event.get_sender_id()
+        if owner != user_id and not event.is_admin():
+            yield event.plain_result(f"只有词提「{schema_name}」的上传者才能修改它。")
+            return
+
+        if key == "选重键":
+            if not value:
+                yield event.plain_result("选重键不能为空。")
+                return
+            self._update_schema_setting(schema_name, "select_keys", value)
+            yield event.plain_result(f"词提「{schema_name}」选重键已更新为：{value}")
+        elif key == "最大长度":
+            try:
+                max_len = int(value)
+            except ValueError:
+                yield event.plain_result("最大长度必须为整数。")
+                return
+            self._update_schema_setting(schema_name, "max_len", max_len)
+            yield event.plain_result(f"词提「{schema_name}」最大长度已更新为：{max_len}")
+        elif key == "标点引导键":
+            self._update_schema_setting(schema_name, "punct_key", value)
+            shown = value if value else "（无）"
+            yield event.plain_result(f"词提「{schema_name}」标点引导键已更新为：{shown}")
+        else:
+            yield event.plain_result(
+                f"未知设置项「{key}」。\n{usage}"
+            )
+
     # ── 删除词提 ────────────────────────────────────────────────────────────
 
     @filter.command("删除词提")
@@ -2358,7 +2425,7 @@ class IMSchemasPlugin(Star):
             yield event.plain_result(f"词提「{schema_name}」不存在。")
             return
         user_id = event.get_sender_id()
-        if owner != user_id:
+        if owner != user_id and not event.is_admin():
             yield event.plain_result(f"只有词提「{schema_name}」的上传者才能删除它。")
             return
         self._delete_schema(schema_name)
