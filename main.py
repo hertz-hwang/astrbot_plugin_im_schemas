@@ -350,6 +350,31 @@ def _key_presses(code: str, max_len: int, pos: int = 1, select_keys: str = "") -
     return len(code) + (1 if len(code) < max_len else 0)
 
 
+def _key_presses_last(code: str, max_len: int, pos: int = 1, select_keys: str = "", candidate_count: int = 1) -> int:
+    """末位字词的按键数：唯一候选（candidate_count==1）且 pos==1 时不需要补首选键。"""
+    if pos > 1:
+        sym = _select_symbol(pos, select_keys)
+        if code.endswith(sym):
+            return len(code)
+        return len(code) + 1
+    if len(code) <= max_len and candidate_count > 1:
+        return len(code) + 1
+    return len(code)
+
+
+def _code_display_last(code: str, max_len: int, pos: int = 1, select_keys: str = "", candidate_count: int = 1) -> str:
+    """末位字词的显示码串：唯一候选（candidate_count==1）且 pos==1 时不补首选键。"""
+    if pos > 1:
+        sym = _select_symbol(pos, select_keys)
+        if code.endswith(sym):
+            return code
+        return code + sym
+    if len(code) <= max_len and candidate_count > 1:
+        first_key = select_keys[0] if select_keys else "_"
+        return code + first_key
+    return code
+
+
 def _omit_in_punct_context(
     code: str,
     pos: int,
@@ -496,17 +521,19 @@ def _open_db() -> sqlite3.Connection:
 class Segment(NamedTuple):
     """一个渲染单元：可能是词组、单字、自编码标点/数字、或缺字。
 
-    - text: 原文（≥1 个字符）
-    - code: 码表中的原始编码；自编码或缺字时为 None
-    - pos:  同码字词中的位序（1 起；自编码 / 缺字时为 1）
-    - is_self_coded: 是否为自编码 passthrough（标点 / 数字 / 字母）
-    - is_missing:    是否为缺字（需查码却未命中，仅出现在单字段）
+    - text:            原文（≥1 个字符）
+    - code:            码表中的原始编码；自编码或缺字时为 None
+    - pos:             同码字词中的位序（1 起；自编码 / 缺字时为 1）
+    - is_self_coded:   是否为自编码 passthrough（标点 / 数字 / 字母）
+    - is_missing:      是否为缺字（需查码却未命中，仅出现在单字段）
+    - candidate_count: 该编码下的候选字词总数（1 表示唯一候选）
     """
     text: str
     code: Optional[str]
     pos: int
     is_self_coded: bool
     is_missing: bool
+    candidate_count: int = 1
 
 
 class IMSchemasPlugin(Star):
@@ -612,10 +639,10 @@ class IMSchemasPlugin(Star):
 
     def _query_word_codes(
         self, schema_name: str, words: list[str]
-    ) -> dict[str, tuple[str, int]]:
-        """批量查询任意词（含单字与词组）的最优 (code, pos)。
+    ) -> dict[str, tuple[str, int, int]]:
+        """批量查询任意词（含单字与词组）的最优 (code, pos, candidate_count)。
         最优定义：编码长度最短，相同长度按 code 字典序最小。
-        pos 是同码字词中（按 rowid 排序）的位序。"""
+        pos 是同码字词中（按 rowid 排序）的位序；candidate_count 是该编码下的候选总数。"""
         unique_words = list({w for w in words if w})
         if not unique_words:
             return {}
@@ -660,14 +687,14 @@ class IMSchemasPlugin(Star):
         for code, w in rows:
             words_by_code.setdefault(code, []).append(w)
 
-        result: dict[str, tuple[str, int]] = {}
+        result: dict[str, tuple[str, int, int]] = {}
         for w, code in best_code.items():
             words_for_code = words_by_code.get(code, [])
             try:
                 pos = words_for_code.index(w) + 1
             except ValueError:
                 pos = 1
-            result[w] = (code, pos)
+            result[w] = (code, pos, len(words_for_code))
         return result
 
     def _query_segments(
@@ -714,8 +741,8 @@ class IMSchemasPlugin(Star):
         # 码表里若直接收录了末位为选重键的条目（如 aa;），用末位键覆盖 pos，
         # 让后续渲染/统计自然把它当作选重处理。
         codes = {
-            w: ((code, _explicit_select_pos(code, select_keys) or pos))
-            for w, (code, pos) in codes.items()
+            w: ((code, _explicit_select_pos(code, select_keys) or pos, cnt))
+            for w, (code, pos, cnt) in codes.items()
         }
 
         INF = float("inf")
@@ -733,10 +760,10 @@ class IMSchemasPlugin(Star):
             # 单字（含 passthrough 字符）：先试码表
             single_hit = codes.get(ch)
             if single_hit is not None:
-                code, pos = single_hit
+                code, pos, cnt = single_hit
                 seg = Segment(
                     text=ch, code=code, pos=pos,
-                    is_self_coded=False, is_missing=False,
+                    is_self_coded=False, is_missing=False, candidate_count=cnt,
                 )
                 cost = dp[i] + _key_presses(code, max_len, pos, select_keys)
                 if cost < dp[i + 1]:
@@ -770,10 +797,10 @@ class IMSchemasPlugin(Star):
                 hit = codes.get(sub)
                 if hit is None:
                     continue
-                code, pos = hit
+                code, pos, cnt = hit
                 seg = Segment(
                     text=sub, code=code, pos=pos,
-                    is_self_coded=False, is_missing=False,
+                    is_self_coded=False, is_missing=False, candidate_count=cnt,
                 )
                 cost = dp[i] + _key_presses(code, max_len, pos, select_keys)
                 if cost < dp[j]:
@@ -1122,6 +1149,7 @@ class IMSchemasPlugin(Star):
         per_presses: list[int] = []
         key_seq_parts: list[str] = []
         for i, seg in enumerate(segments):
+            is_last = (i == n - 1)
             if seg.is_missing:
                 # 缺字显示为 6 个问号，码长按 6 计入（每个缺字字符算 6 键）
                 per_presses.append(6 * len(seg.text))
@@ -1135,6 +1163,9 @@ class IMSchemasPlugin(Star):
                     presses, disp = omit
                     per_presses.append(presses)
                     key_seq_parts.append(disp)
+                elif is_last:
+                    per_presses.append(_key_presses_last(code, max_len, pos, select_keys, seg.candidate_count))
+                    key_seq_parts.append(_code_display_last(code, max_len, pos, select_keys, seg.candidate_count))
                 else:
                     per_presses.append(_key_presses(code, max_len, pos, select_keys))
                     key_seq_parts.append(_code_display(code, max_len, pos, select_keys))
@@ -1367,6 +1398,7 @@ class IMSchemasPlugin(Star):
         cell_codes: list[Optional[str]] = []
         key_seq_parts: list[str] = []
         for i, seg in enumerate(segments):
+            is_last = (i == n - 1)
             if seg.is_missing:
                 # 缺字显示为 6 个问号，码长按 6 计入
                 per_presses.append(6 * len(seg.text))
@@ -1381,6 +1413,11 @@ class IMSchemasPlugin(Star):
                 if omit is not None:
                     presses, disp = omit
                     per_presses.append(presses)
+                    cell_codes.append(disp)
+                    key_seq_parts.append(disp)
+                elif is_last:
+                    per_presses.append(_key_presses_last(code, max_len, pos, select_keys, seg.candidate_count))
+                    disp = _code_display_last(code, max_len, pos, select_keys, seg.candidate_count)
                     cell_codes.append(disp)
                     key_seq_parts.append(disp)
                 else:
@@ -2112,7 +2149,7 @@ class IMSchemasPlugin(Star):
             paragraphs = paragraphs[1:-1]
             raw = "\n".join(paragraphs)
 
-        return re.sub(r"\s+", "", raw), race_header
+        return re.sub(r"[^\S\n]+", "", raw).replace("\n", " "), race_header
 
     @filter.regex(r"^(?:@\S+\s+)*\S+(?:\s+(?:.+))?$")
     async def cmd_query(self, event: AstrMessageEvent):
