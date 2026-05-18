@@ -351,25 +351,25 @@ def _key_presses(code: str, max_len: int, pos: int = 1, select_keys: str = "") -
 
 
 def _key_presses_last(code: str, max_len: int, pos: int = 1, select_keys: str = "", candidate_count: int = 1) -> int:
-    """末位字词的按键数：唯一候选（candidate_count==1）且 pos==1 时不需要补首选键。"""
+    """末位字词的按键数：打满码（len==max_len）且唯一候选时不需要补首选键。"""
     if pos > 1:
         sym = _select_symbol(pos, select_keys)
         if code.endswith(sym):
             return len(code)
         return len(code) + 1
-    if len(code) <= max_len and candidate_count > 1:
+    if len(code) < max_len or candidate_count > 1:
         return len(code) + 1
     return len(code)
 
 
 def _code_display_last(code: str, max_len: int, pos: int = 1, select_keys: str = "", candidate_count: int = 1) -> str:
-    """末位字词的显示码串：唯一候选（candidate_count==1）且 pos==1 时不补首选键。"""
+    """末位字词的显示码串：打满码（len==max_len）且唯一候选时不补首选键。"""
     if pos > 1:
         sym = _select_symbol(pos, select_keys)
         if code.endswith(sym):
             return code
         return code + sym
-    if len(code) <= max_len and candidate_count > 1:
+    if len(code) < max_len or candidate_count > 1:
         first_key = select_keys[0] if select_keys else "_"
         return code + first_key
     return code
@@ -1189,18 +1189,21 @@ class IMSchemasPlugin(Star):
         total_presses = sum(per_presses)
         avg_len = total_presses / counted_chars if counted_chars else 0.0
         equivalence = _pair_equivalence_avg("".join(key_seq_parts))
+        six_speed = 360 / avg_len if avg_len else None
         return {
             "avg_len": avg_len,
             "sel_count": sel_count,
             "missing": missing,
             "equivalence": equivalence,
+            "six_speed": six_speed,
         }
 
     def _all_sort_key(self, stats: dict) -> tuple:
-        """all 组排序：码长↑ → 选重↑ → 当量↑（None 视为 +inf）→ 缺字↑。"""
+        """all 组排序：六击速度↓ → 选重↑ → 当量↑（None 视为 +inf）→ 缺字↑。"""
         eq = stats["equivalence"]
+        spd = stats["six_speed"]
         return (
-            stats["avg_len"],
+            float("inf") if spd is None else -spd,
             stats["sel_count"],
             float("inf") if eq is None else eq,
             stats["missing"],
@@ -1446,12 +1449,15 @@ class IMSchemasPlugin(Star):
         avg_len = total_presses / counted_chars if counted_chars else 0.0
         difficulty, diff_score = _text_difficulty(chars)
         equivalence = _pair_equivalence_avg("".join(key_seq_parts))
+        six_speed = 360 / avg_len if avg_len else None
 
         line1 = f"难度: {difficulty}({diff_score})"
         line2 = f"【{schema_name}】"
         eq_str = f"{equivalence:.6f}" if equivalence is not None else "--"
+        spd_str = f"{six_speed:.2f}" if six_speed is not None else "--"
         line3 = f"来源: {owner_id}        字数: {len(chars)}        缺字: {missing}"
         line4 = f"码长: {avg_len:.6f}        选重: {sel_count}        当量: {eq_str}"
+        line5 = f"六击速度: {spd_str}"
 
         _, sgh, sbot = msr("难度: A", fonts_stats)
         _, char_gh, char_bot = msr("我", fonts_char)
@@ -1475,7 +1481,7 @@ class IMSchemasPlugin(Star):
                 codew, _, _ = msr(cs, fonts_code_sel if is_sel_cell else fonts_code)
             cell_widths.append(max(cw, codew) + CELL_GAP)
 
-        stats_w = max(msr(l, fonts_stats)[0] for l in [line1, line2, line3, line4])
+        stats_w = max(msr(l, fonts_stats)[0] for l in [line1, line2, line3, line4, line5])
         MAX_IMG_W = 1200
         content_w = sum(cell_widths)
         STATS_KB_GAP = 24
@@ -1499,7 +1505,7 @@ class IMSchemasPlugin(Star):
             rows.append(cur)
 
         LINE_H = sbot + 6
-        STATS_H = LINE_H * 4
+        STATS_H = LINE_H * 5
         UL_GAP = 4
         CODE_GAP = 5
         ROW_H = char_bot + UL_GAP + 1 + CODE_GAP + code_row_bot
@@ -1518,7 +1524,7 @@ class IMSchemasPlugin(Star):
         # 顶部 stats 在左、键盘热力图在右上
         stats_y = PAD + (top_block_h - STATS_H) // 2 if show_keyboard else PAD
         y = stats_y
-        for line in [line1, line2, line3, line4]:
+        for line in [line1, line2, line3, line4, line5]:
             _render_text_with_fallback(draw, (PAD, y), line, fonts_stats, (50, 50, 50))
             y += LINE_H
 
@@ -1708,10 +1714,11 @@ class IMSchemasPlugin(Star):
         title_h = sum(line_bots) + TITLE_LINE_GAP * (len(title_lines) - 1)
         tw = max(line_widths) if line_widths else 0
 
-        headers = ["方案", "来源", "码长", "选重", "缺字", "当量"]
+        headers = ["方案", "来源", "码长", "选重", "缺字", "当量", "六击速度"]
 
         def _row_cells(d: dict) -> list[str]:
             eq = d["equivalence"]
+            spd = d["six_speed"]
             return [
                 d["name"],
                 d["owner_id"],
@@ -1719,6 +1726,7 @@ class IMSchemasPlugin(Star):
                 str(d["sel_count"]),
                 str(d["missing"]),
                 f"{eq:.6f}" if eq is not None else "--",
+                f"{spd:.2f}" if spd is not None else "--",
             ]
 
         all_rows_text = [headers] + [_row_cells(d) for d in rows_data]
