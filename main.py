@@ -2101,7 +2101,7 @@ class IMSchemasPlugin(Star):
         owner_count = len({owner for _, owner, _ in schemas})
         title = f"共 {len(schemas)} 个词提，来自 {owner_count} 个来源"
 
-        items = [f"{name}（{self._display_owner(owner, alias)}）" for name, owner, alias in schemas]
+        items = [f"{name}（来源：{alias if alias else owner}，UP：{owner}）" for name, owner, alias in schemas]
         sep = "、"
 
         MAX_IMG_W = 1200
@@ -2228,6 +2228,22 @@ class IMSchemasPlugin(Star):
             yield event.plain_result("无法获取文件下载链接，请重新发送文件后重试。")
             return
 
+        user_id = event.get_sender_id()
+        is_admin = event.is_admin()
+
+        file_size = getattr(file_seg, "size", None)
+        if file_size is not None and not is_admin:
+            max_size_mb = 50
+            max_size_bytes = max_size_mb * 1024 * 1024
+            if file_size > max_size_bytes:
+                size_mb = file_size / (1024 * 1024)
+                yield event.plain_result(
+                    f"文件过大！用户上传文件限制在 {max_size_mb}MB 以内，"
+                    f"当前文件大小为 {size_mb:.2f}MB。\n"
+                    f"如果需要，请联系管理员上传：荒 1121144145。"
+                )
+                return
+
         yield event.plain_result("正在下载并解析码表，请稍候…")
 
         content = await self._download_text(url)
@@ -2242,8 +2258,7 @@ class IMSchemasPlugin(Star):
             )
             return
 
-        user_id = event.get_sender_id()
-        if not event.is_admin():
+        if not is_admin:
             existing_owner = self._schema_owner(schema_name)
             if existing_owner is not None and existing_owner != user_id:
                 yield event.plain_result(f"词提「{schema_name}」已存在且不属于你，无法覆盖。")
@@ -2302,7 +2317,7 @@ class IMSchemasPlugin(Star):
         """
         text = event.message_str.strip()
         # 引用回复时，QQ 客户端会在消息开头自动追加 `@对方` 提及，剥离后再做查询匹配
-        text = re.sub(r"^(?:@\S+\s+)+", "", text)
+        text = re.sub(r"^(?:@[^\s@]+(?:\s+[^\s@]+)?\s+)+", "", text)
         m = re.match(r"^(\S+)(?:\s+(.+))?$", text)
         if not m:
             return
