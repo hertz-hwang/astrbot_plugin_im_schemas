@@ -68,17 +68,32 @@ def _build_cmap(font_path: Path) -> frozenset[int]:
 
 
 # 模块级预加载：(cmap码位集, 字体路径) 列表，启动时构建一次
-_FONT_CMAPS: list[tuple[frozenset[int], Path]] = [
-    (_build_cmap(p), p)
-    for p in _BUNDLED_FONTS
-    if p.exists()
-]
+_FONT_CMAPS: list[tuple[frozenset[int], Path]] = []
+_FONT_CMAPS_INITIALIZED = False
+_FONT_CMAPS_LOCK = threading.Lock()
+
+
+def _ensure_font_cmaps_loaded() -> None:
+    """延迟初始化字体 cmap，避免模块导入时阻塞。"""
+    global _FONT_CMAPS, _FONT_CMAPS_INITIALIZED
+    if _FONT_CMAPS_INITIALIZED:
+        return
+    with _FONT_CMAPS_LOCK:
+        if _FONT_CMAPS_INITIALIZED:
+            return
+        _FONT_CMAPS[:] = [
+            (_build_cmap(p), p)
+            for p in _BUNDLED_FONTS
+            if p.exists()
+        ]
+        _FONT_CMAPS_INITIALIZED = True
 
 
 @lru_cache(maxsize=16)
 def _load_fonts(size: int) -> tuple[ImageFont.FreeTypeFont, ...]:
     """按优先级加载所有可用字体，返回 Pillow 字体元组。
     用 lru_cache 缓存，避免每次画图都重新读取字体文件（每个字号都要 IO）。"""
+    _ensure_font_cmaps_loaded()
     fonts: list[ImageFont.FreeTypeFont] = []
     for _, p in _FONT_CMAPS:
         try:
@@ -92,6 +107,7 @@ def _load_fonts(size: int) -> tuple[ImageFont.FreeTypeFont, ...]:
 
 def _pick_font_idx(ch: str) -> int:
     """根据 cmap 选择字体下标；找不到返回 0（首字体兜底）。"""
+    _ensure_font_cmaps_loaded()
     cp = ord(ch)
     for i, (cmap, _) in enumerate(_FONT_CMAPS):
         if cp in cmap:
@@ -191,30 +207,38 @@ _RANK_DATA_DIR = Path(__file__).parent / "rank_data"
 _RANK_LETTER_DIGIT = string.ascii_letters + string.digits
 _RANK_PUNCT_KEEP = set(":,.;!'\"")
 
-
-def _load_rank_data() -> tuple[dict, set, set]:
-    """加载难度测算所需的三份语料：词频表 / 有效字符集 / 词组前缀集。
-    缺失或损坏时返回空容器，调用方会退化为分数 -1（与原算法异常分支一致）。"""
-    try:
-        with open(_RANK_DATA_DIR / "zongCiPin.json", encoding="utf-8") as f:
-            zong = json.load(f)
-        with open(_RANK_DATA_DIR / "validChar.json", encoding="utf-8") as f:
-            valid = set(json.load(f).get("k", []))
-        with open(_RANK_DATA_DIR / "pre.json", encoding="utf-8") as f:
-            pre = set(json.load(f).get("k", []))
-        return zong, valid, pre
-    except (OSError, ValueError) as e:
-        logger.warning(f"[im_schemas] 难度测算数据加载失败: {e}")
-        return {}, set(), set()
+_RANK_ZONG_CIPIN: dict = {}
+_RANK_VALID_CHAR: set = set()
+_RANK_PRE: set = set()
+_RANK_DATA_INITIALIZED = False
+_RANK_DATA_LOCK = threading.Lock()
 
 
-_RANK_ZONG_CIPIN, _RANK_VALID_CHAR, _RANK_PRE = _load_rank_data()
+def _ensure_rank_data_loaded() -> None:
+    """延迟初始化难度测算数据，避免模块导入时阻塞。"""
+    global _RANK_ZONG_CIPIN, _RANK_VALID_CHAR, _RANK_PRE, _RANK_DATA_INITIALIZED
+    if _RANK_DATA_INITIALIZED:
+        return
+    with _RANK_DATA_LOCK:
+        if _RANK_DATA_INITIALIZED:
+            return
+        try:
+            with open(_RANK_DATA_DIR / "zongCiPin.json", encoding="utf-8") as f:
+                _RANK_ZONG_CIPIN = json.load(f)
+            with open(_RANK_DATA_DIR / "validChar.json", encoding="utf-8") as f:
+                _RANK_VALID_CHAR = set(json.load(f).get("k", []))
+            with open(_RANK_DATA_DIR / "pre.json", encoding="utf-8") as f:
+                _RANK_PRE = set(json.load(f).get("k", []))
+        except (OSError, ValueError) as e:
+            logger.warning(f"[im_schemas] 难度测算数据加载失败: {e}")
+        _RANK_DATA_INITIALIZED = True
 
 
 def _text_difficulty(chars: list[str]) -> tuple[str, object]:
     """依据「字根月饼」的 rank 算法测算文本难度。
     返回 (难度等级中文, 分数)；分数 >100 时返回字符串「爆表{score}」。
     数据缺失或异常时返回 ("--", -1)。"""
+    _ensure_rank_data_loaded()
     if not _RANK_VALID_CHAR or not _RANK_ZONG_CIPIN:
         return "--", -1
 
@@ -396,25 +420,32 @@ def _omit_in_punct_context(
     return None
 
 
-def _load_pair_equivalence() -> dict[str, float]:
-    """加载按键对当量表：第一列是两键 pair，第二列是当量值。"""
-    path = Path(__file__).parent / "pair_equivalence.txt"
-    table: dict[str, float] = {}
-    try:
-        with open(path, encoding="utf-8") as f:
-            for line in f:
-                parts = line.rstrip("\n").split("\t")
-                if len(parts) >= 2 and len(parts[0]) == 2:
-                    try:
-                        table[parts[0]] = float(parts[1])
-                    except ValueError:
-                        pass
-    except OSError:
-        logger.warning("[im_schemas] 未找到 pair_equivalence.txt，当量计算不可用。")
-    return table
+_PAIR_EQUIVALENCE: dict[str, float] = {}
+_PAIR_EQUIVALENCE_INITIALIZED = False
+_PAIR_EQUIVALENCE_LOCK = threading.Lock()
 
 
-_PAIR_EQUIVALENCE: dict[str, float] = _load_pair_equivalence()
+def _ensure_pair_equivalence_loaded() -> None:
+    """延迟初始化按键对当量表，避免模块导入时阻塞。"""
+    global _PAIR_EQUIVALENCE, _PAIR_EQUIVALENCE_INITIALIZED
+    if _PAIR_EQUIVALENCE_INITIALIZED:
+        return
+    with _PAIR_EQUIVALENCE_LOCK:
+        if _PAIR_EQUIVALENCE_INITIALIZED:
+            return
+        path = Path(__file__).parent / "pair_equivalence.txt"
+        try:
+            with open(path, encoding="utf-8") as f:
+                for line in f:
+                    parts = line.rstrip("\n").split("\t")
+                    if len(parts) >= 2 and len(parts[0]) == 2:
+                        try:
+                            _PAIR_EQUIVALENCE[parts[0]] = float(parts[1])
+                        except ValueError:
+                            pass
+        except OSError:
+            logger.warning("[im_schemas] 未找到 pair_equivalence.txt，当量计算不可用。")
+        _PAIR_EQUIVALENCE_INITIALIZED = True
 
 
 # QWERTY 热力图布局：(左缩进 in key 单位, [(label, key), ...])
@@ -457,6 +488,7 @@ def _build_key_counts(key_seq: str) -> dict[str, int]:
 
 def _pair_equivalence_avg(key_seq: str) -> Optional[float]:
     """整段打法所有相邻按键对的均当量；不足两键或无命中返回 None。"""
+    _ensure_pair_equivalence_loaded()
     if len(key_seq) < 2 or not _PAIR_EQUIVALENCE:
         return None
     seq = key_seq.lower()
