@@ -2162,10 +2162,12 @@ class IMSchemasPlugin(Star):
             return
         await event.send(
             event.plain_result(
+                "【每位用户允许上传 3 份词提】\n"
                 "文件已收到。请引用回复上方文件消息，并发送：\n"
                 "khkh上传词提 [词提名]\n\n"
                 "示例：khkh上传词提 五笔86\n\n"
                 "首次上传后，可单独设置以下参数（不会被后续重新上传重置）：\n"
+                "  khkh设置词提 [词提名] 来源=[别名]\n"
                 "  khkh设置词提 [词提名] 选重键=_;'4567890\n"
                 "  khkh设置词提 [词提名] 最大长度=4\n"
                 "  khkh设置词提 [词提名] 标点引导键=/"
@@ -2254,7 +2256,9 @@ class IMSchemasPlugin(Star):
         entries = self._parse_tsv(content)
         if not entries:
             yield event.plain_result(
-                "未能解析出有效条目。请确认文件为 TSV 格式：第一列编码，第二列字词，Tab 分隔。"
+                "未能解析出有效条目。请确认文件为以下两类 TSV 格式：\n\n"
+                "1. 第一列编码，第二列字词，Tab 分隔。\n"
+                "2. 第一列编码，第二列字词1，第三列字词2，第四列字词3……，Tab 分隔。\n"
             )
             return
 
