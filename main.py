@@ -2178,7 +2178,7 @@ class IMSchemasPlugin(Star):
 
         return re.sub(r"[^\S\n]+", "", raw).replace("\n", " "), race_header
 
-    @filter.regex(r"^(?:@\S+\s+)*\S+(?:\s+(?:.+))?$")
+    @filter.regex(r"^(?:@\S+\s+)*(\S+)(?:\s+(.+))?$")
     async def cmd_query(self, event: AstrMessageEvent):
         """
         用法：查询方案打法，发送
@@ -2193,6 +2193,12 @@ class IMSchemasPlugin(Star):
         head, rest = m.group(1), m.group(2)
         if head.startswith("%"):
             return
+
+        # 快速过滤：head 必须是已知词提名或 all 触发词，否则不处理
+        if not (self._is_all_trigger(head) or self._schema_exists(head)):
+            # 检查是否为多词提对比或反查模式
+            if not head.startswith("/"):
+                return
 
         prefix_pat = (self.config.get("single_char_prefix", "") or "").strip()
 
