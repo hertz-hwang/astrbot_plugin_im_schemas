@@ -669,22 +669,18 @@ class IMSchemasPlugin(Star):
 
     def _update_schema_setting(self, name: str, field: str, value) -> None:
         """更新单个词提配置字段（select_keys / max_len / punct_key / owner_alias）。"""
-        if field == "select_keys":
-            db_field = "select_keys"
-        elif field == "max_len":
-            db_field = "max_len"
-        elif field == "punct_key":
-            db_field = "punct_key"
-        elif field == "来源":
-            db_field = "owner_alias"
-        else:
+        QUERIES = {
+            "select_keys": "UPDATE schemas SET select_keys = ? WHERE name = ?",
+            "max_len": "UPDATE schemas SET max_len = ? WHERE name = ?",
+            "punct_key": "UPDATE schemas SET punct_key = ? WHERE name = ?",
+            "来源": "UPDATE schemas SET owner_alias = ? WHERE name = ?",
+        }
+        sql = QUERIES.get(field)
+        if sql is None:
             raise ValueError(f"unsupported schema field: {field}")
 
         with _open_db() as conn:
-            conn.execute(
-                f"UPDATE schemas SET {db_field} = ? WHERE name = ?",
-                (value, name),
-            )
+            conn.execute(sql, (value, name))
             conn.commit()
 
     def _delete_schema(self, name: str) -> None:
