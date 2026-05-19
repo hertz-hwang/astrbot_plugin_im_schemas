@@ -1057,18 +1057,28 @@ class IMSchemasPlugin(Star):
 
     @staticmethod
     def _parse_tsv(content: str) -> list[tuple[str, str]]:
-        """解析 TSV 码表，第一列编码，第二列字词，返回 [(code, word), ...]。"""
+        """解析 TSV 码表，第一列编码，后续每列为一个候选字词，
+        返回 [(code, word), ...]。
+
+        支持两种格式：
+          1. 两列：code<TAB>word
+          2. 多列：code<TAB>候选1<TAB>候选2<TAB>候选3……
+        """
         entries: list[tuple[str, str]] = []
         for raw in content.splitlines():
             line = raw.strip()
             if not line or line.startswith("#"):
                 continue
-            parts = line.split("\t", 1)
+            parts = line.split("\t")
             if len(parts) < 2:
                 continue
-            code, word = parts[0].strip(), parts[1].strip()
-            if code and word:
-                entries.append((code, word))
+            code = parts[0].strip()
+            if not code:
+                continue
+            for i in range(1, len(parts)):
+                word = parts[i].strip()
+                if word:
+                    entries.append((code, word))
         return entries
 
     # ── 文件下载 ────────────────────────────────────────────────────────────
@@ -2256,9 +2266,9 @@ class IMSchemasPlugin(Star):
         entries = self._parse_tsv(content)
         if not entries:
             yield event.plain_result(
-                "未能解析出有效条目。请确认文件为以下两类 TSV 格式：\n\n"
-                "1. 第一列编码，第二列字词，Tab 分隔。\n"
-                "2. 第一列编码，第二列字词1，第三列字词2，第四列字词3……，Tab 分隔。\n"
+                "未能解析出有效条目。请确认文件为 TSV 格式：\n"
+                "第一列编码，后续每列为一个候选字词，Tab 分隔。\n"
+                "例如：a<TAB>工<TAB>公<TAB>功 或 a<TAB>工。\n"
             )
             return
 
