@@ -672,15 +672,17 @@ class IMSchemasPlugin(Star):
 
     def _update_schema_setting(self, name: str, field: str, value) -> None:
         """更新单个词提配置字段（select_keys / max_len / punct_key / owner_alias）。"""
-        field_map = {
-            "select_keys": "select_keys",
-            "max_len": "max_len",
-            "punct_key": "punct_key",
-            "来源": "owner_alias",
-        }
-        db_field = field_map.get(field)
-        if db_field is None:
+        if field == "select_keys":
+            db_field = "select_keys"
+        elif field == "max_len":
+            db_field = "max_len"
+        elif field == "punct_key":
+            db_field = "punct_key"
+        elif field == "来源":
+            db_field = "owner_alias"
+        else:
             raise ValueError(f"unsupported schema field: {field}")
+
         with _open_db() as conn:
             conn.execute(
                 f"UPDATE schemas SET {db_field} = ? WHERE name = ?",
