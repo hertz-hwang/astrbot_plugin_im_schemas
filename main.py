@@ -516,6 +516,10 @@ def _pair_equivalence_avg(key_seq: str) -> Optional[float]:
 _DB_INITIALIZED = False
 _DB_LOCK = threading.Lock()
 
+# Schema name cache: set of all schema names, updated on import/delete
+_SCHEMA_NAMES_CACHE: set[str] = set()
+_SCHEMA_NAMES_CACHE_LOCK = threading.Lock()
+
 
 def _init_db(conn: sqlite3.Connection) -> None:
     # 写入 db 文件头的持久 PRAGMA：跨连接生效，但 auto_vacuum 切换需要一次 VACUUM 提交。
@@ -621,11 +625,19 @@ class IMSchemasPlugin(Star):
     # ── 数据库操作 ──────────────────────────────────────────────────────────
 
     def _schema_exists(self, name: str) -> bool:
+        # Check cache first
+        if name in _SCHEMA_NAMES_CACHE:
+            return True
+        # If not in cache, check database and update cache
         with _open_db() as conn:
             row = conn.execute(
                 "SELECT 1 FROM schemas WHERE name = ?", (name,)
             ).fetchone()
-            return row is not None
+            exists = row is not None
+            if exists:
+                with _SCHEMA_NAMES_CACHE_LOCK:
+                    _SCHEMA_NAMES_CACHE.add(name)
+            return exists
 
     def _schema_owner(self, name: str) -> Optional[str]:
         with _open_db() as conn:
@@ -679,7 +691,10 @@ class IMSchemasPlugin(Star):
             ).fetchone()[0]
             # 把更新过程中产生的空 page 归还 OS，避免文件单调膨胀。
             conn.execute("PRAGMA incremental_vacuum")
-            return count
+        # Update schema name cache
+        with _SCHEMA_NAMES_CACHE_LOCK:
+            _SCHEMA_NAMES_CACHE.add(name)
+        return count
 
     def _update_schema_setting(self, name: str, field: str, value) -> None:
         """更新单个词提配置字段（select_keys / max_len / punct_key / owner_alias）。"""
@@ -703,6 +718,9 @@ class IMSchemasPlugin(Star):
             conn.execute("DELETE FROM schemas WHERE name = ?", (name,))
             conn.commit()
             conn.execute("PRAGMA incremental_vacuum")
+        # Remove from schema name cache
+        with _SCHEMA_NAMES_CACHE_LOCK:
+            _SCHEMA_NAMES_CACHE.discard(name)
 
     def _max_word_len(self, schema_name: str) -> int:
         """该方案中最长词组的字数；用于限制 DP 候选子串长度。"""
