@@ -606,6 +606,17 @@ class IMSchemasPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
         self.config = config
+        self._warm_schema_cache()
+
+    def _warm_schema_cache(self) -> None:
+        """启动时预热方案名缓存，避免后续重复查库。"""
+        try:
+            with _open_db() as conn:
+                rows = conn.execute("SELECT name FROM schemas").fetchall()
+            with _SCHEMA_NAMES_CACHE_LOCK:
+                _SCHEMA_NAMES_CACHE.update(r[0] for r in rows)
+        except Exception as e:
+            logger.warning(f"[im_schemas] 方案名缓存预热失败: {e}")
 
     def _all_group_schemas(self) -> list[str]:
         """读取配置中的 all 组方案名列表，过滤掉空串和不存在的方案。"""
@@ -725,17 +736,16 @@ class IMSchemasPlugin(Star):
     def _max_word_len(self, schema_name: str, conn: Optional[sqlite3.Connection] = None) -> int:
         """该方案中最长词组的字数；用于限制 DP 候选子串长度。"""
         if conn is None:
-            with _open_db() as conn:
-                row = conn.execute(
-                    "SELECT MAX(LENGTH(word)) FROM codes WHERE schema_name = ?",
-                    (schema_name,),
-                ).fetchone()
-        else:
-            row = conn.execute(
-                "SELECT MAX(LENGTH(word)) FROM codes WHERE schema_name = ?",
-                (schema_name,),
-            ).fetchone()
-        # SQLite LENGTH 对 UTF-8 字符串返回字符数（非字节数），可直接用
+            with _open_db() as c:
+                return self._max_word_len_impl(schema_name, c)
+        return self._max_word_len_impl(schema_name, conn)
+
+    def _max_word_len_impl(self, schema_name: str, conn: sqlite3.Connection) -> int:
+        """实现 _max_word_len 的核心逻辑，接收已打开的连接。"""
+        row = conn.execute(
+            "SELECT MAX(LENGTH(word)) FROM codes WHERE schema_name = ?",
+            (schema_name,),
+        ).fetchone()
         return int(row[0]) if row and row[0] else 1
 
     def _query_word_codes(
@@ -748,91 +758,60 @@ class IMSchemasPlugin(Star):
         if not unique_words:
             return {}
 
-        def _fetch_in_with_conn(sql_tpl: str, items: list[str], c: sqlite3.Connection) -> list[tuple]:
+        if conn is None:
+            with _open_db() as c:
+                return self._query_word_codes_impl(schema_name, unique_words, c)
+        return self._query_word_codes_impl(schema_name, unique_words, conn)
+
+    def _query_word_codes_impl(
+        self, schema_name: str, unique_words: list[str], conn: sqlite3.Connection
+    ) -> dict[str, tuple[str, int, int]]:
+        """实现 _query_word_codes 的核心逻辑，接收已打开的连接。"""
+        def _fetch_in_with_conn(sql_tpl: str, items: list[str]) -> list[tuple]:
             CHUNK = 500
             out: list[tuple] = []
             for i in range(0, len(items), CHUNK):
                 batch = items[i:i + CHUNK]
                 placeholders = ",".join("?" * len(batch))
-                out.extend(c.execute(
+                out.extend(conn.execute(
                     sql_tpl.format(ph=placeholders),
                     (schema_name, *batch),
                 ).fetchall())
             return out
 
-        if conn is None:
-            with _open_db() as conn:
-                rows = _fetch_in_with_conn(
-                    "SELECT word, code FROM codes WHERE schema_name = ? AND word IN ({ph})",
-                    unique_words,
-                    conn,
-                )
+        rows = _fetch_in_with_conn(
+            "SELECT word, code FROM codes WHERE schema_name = ? AND word IN ({ph})",
+            unique_words,
+        )
 
-                best_code: dict[str, str] = {}
-                for w, code in rows:
-                    cur = best_code.get(w)
-                    if cur is None or (len(code), code) < (len(cur), cur):
-                        best_code[w] = code
+        best_code: dict[str, str] = {}
+        for w, code in rows:
+            cur = best_code.get(w)
+            if cur is None or (len(code), code) < (len(cur), cur):
+                best_code[w] = code
 
-                if not best_code:
-                    return {}
+        if not best_code:
+            return {}
 
-                unique_codes = list(set(best_code.values()))
-                rows = _fetch_in_with_conn(
-                    "SELECT code, word FROM codes WHERE schema_name = ? AND code IN ({ph}) ORDER BY rowid",
-                    unique_codes,
-                    conn,
-                )
+        unique_codes = list(set(best_code.values()))
+        rows = _fetch_in_with_conn(
+            "SELECT code, word FROM codes WHERE schema_name = ? AND code IN ({ph}) ORDER BY rowid",
+            unique_codes,
+        )
 
-                words_by_code: dict[str, list[str]] = {}
-                for code, w in rows:
-                    words_by_code.setdefault(code, []).append(w)
+        words_by_code: dict[str, list[str]] = {}
+        for code, w in rows:
+            words_by_code.setdefault(code, []).append(w)
 
-                result: dict[str, tuple[str, int, int]] = {}
-                for w, code in best_code.items():
-                    words_for_code = words_by_code.get(code, [])
-                    try:
-                        pos = words_for_code.index(w) + 1
-                    except ValueError:
-                        pos = 1
-                    result[w] = (code, pos, len(words_for_code))
-                return result
-        else:
-            rows = _fetch_in_with_conn(
-                "SELECT word, code FROM codes WHERE schema_name = ? AND word IN ({ph})",
-                unique_words,
-                conn,
-            )
-
-            best_code: dict[str, str] = {}
-            for w, code in rows:
-                cur = best_code.get(w)
-                if cur is None or (len(code), code) < (len(cur), cur):
-                    best_code[w] = code
-
-            if not best_code:
-                return {}
-
-            unique_codes = list(set(best_code.values()))
-            rows = _fetch_in_with_conn(
-                "SELECT code, word FROM codes WHERE schema_name = ? AND code IN ({ph}) ORDER BY rowid",
-                unique_codes,
-                conn,
-            )
-
-            words_by_code: dict[str, list[str]] = {}
-            for code, w in rows:
-                words_by_code.setdefault(code, []).append(w)
-
-            result: dict[str, tuple[str, int, int]] = {}
-            for w, code in best_code.items():
-                words_for_code = words_by_code.get(code, [])
-                try:
-                    pos = words_for_code.index(w) + 1
-                except ValueError:
-                    pos = 1
-                result[w] = (code, pos, len(words_for_code))
-            return result
+        result: dict[str, tuple[str, int, int]] = {}
+        for w, code in best_code.items():
+            words_for_code = words_by_code.get(code, [])
+            try:
+                pos = words_for_code.index(w) + 1
+            except ValueError:
+                pos = 1
+            result[w] = (code, pos, len(words_for_code))
+        return result
 
     def _query_segments(
         self,
@@ -1155,6 +1134,7 @@ class IMSchemasPlugin(Star):
         glow = glow.filter(ImageFilter.GaussianBlur(60))
         bg = bg.convert("RGBA")
         bg.alpha_composite(glow)
+        glow.close()
 
         # 2) 卡片阴影：黑 12% 的圆角矩形 → 高斯模糊 → 偏移
         shadow_canvas = Image.new("RGBA", (W, H), (0, 0, 0, 0))
@@ -1166,6 +1146,7 @@ class IMSchemasPlugin(Star):
         )
         shadow_canvas = shadow_canvas.filter(ImageFilter.GaussianBlur(SHADOW_BLUR))
         bg.alpha_composite(shadow_canvas)
+        shadow_canvas.close()
 
         # 3) 圆角白卡（用 mask 把内容图剪成圆角），再加 1px 浅边
         card = Image.new("RGBA", (cw, ch), (255, 255, 255, 255))
@@ -1187,6 +1168,9 @@ class IMSchemasPlugin(Star):
         )
         card.alpha_composite(border)
         bg.alpha_composite(card, dest=(OUTER, OUTER))
+        mask.close()
+        border.close()
+        card.close()
 
         # 4) 顶部彩条（左右淡出 → 中间饱和）
         bar = Image.new("RGBA", (cw - BAR_INSET * 2, BAR_H), (0, 0, 0, 0))
@@ -1213,6 +1197,7 @@ class IMSchemasPlugin(Star):
                 color = (62, 175, 124, int(255 * (1 - k) * 0.6))
             bar_draw.line([(x, 0), (x, BAR_H)], fill=color)
         bg.alpha_composite(bar, dest=(OUTER + BAR_INSET, OUTER))
+        bar.close()
 
         return bg.convert("RGB")
 
@@ -1758,6 +1743,8 @@ class IMSchemasPlugin(Star):
         items.sort(key=lambda t: self._all_sort_key(t[1]))
 
         sub_imgs: list[Image.Image] = []
+        probe = None
+        canvas = None
         try:
             for _, _, b in items:
                 sub_imgs.append(Image.open(BytesIO(b)).convert("RGB"))
@@ -1797,10 +1784,12 @@ class IMSchemasPlugin(Star):
                 y += im.height + GAP
 
             result = self._to_png_bytes(canvas)
-            probe.close()
-            canvas.close()
             return result
         finally:
+            if probe is not None:
+                probe.close()
+            if canvas is not None:
+                canvas.close()
             for im in sub_imgs:
                 im.close()
 
