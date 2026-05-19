@@ -1359,6 +1359,7 @@ class IMSchemasPlugin(Star):
         else:
             _render_text_with_fallback(draw, (PAD + 8, y), missing_placeholder, fonts_dafa, (180, 60, 220))
 
+        probe.close()
         return self._to_png_bytes(img, decorate=decorate)
 
     def _draw_keyboard_heatmap(
@@ -1643,6 +1644,7 @@ class IMSchemasPlugin(Star):
 
                 x += cell_widths[i]
 
+        probe.close()
         return self._to_png_bytes(img, decorate=decorate)
 
     # ── all 组：聚合多个方案的查询结果 ──────────────────────────────────────
@@ -1830,6 +1832,7 @@ class IMSchemasPlugin(Star):
                 x += col_widths[i] + COL_GAP
             y += ROW_H
 
+        probe.close()
         return self._to_png_bytes(img)
 
     def _make_all_empty_image(self, word: str) -> bytes:
@@ -1845,6 +1848,7 @@ class IMSchemasPlugin(Star):
         img = Image.new("RGB", (IMG_W, IMG_H), (255, 255, 255))
         draw = ImageDraw.Draw(img)
         _render_text_with_fallback(draw, (PAD, PAD), text, fonts, (180, 60, 60))
+        probe.close()
         return self._to_png_bytes(img)
 
     def _make_reverse_image(
@@ -1977,6 +1981,7 @@ class IMSchemasPlugin(Star):
                 y += word_bot + LINE_GAP
             y += BLOCK_GAP
 
+        probe.close()
         return self._to_png_bytes(img, decorate=decorate)
 
     def _make_reverse_all_image(
@@ -2068,6 +2073,7 @@ class IMSchemasPlugin(Star):
             _render_text_with_fallback(draw, (PAD, y), line, fonts_body, (40, 40, 40))
             y += LINE_H
 
+        probe.close()
         return self._to_png_bytes(img)
 
     # ── 私聊：收到文件时给出上传指引 ──────────────────────────────────────
