@@ -1683,43 +1683,52 @@ class IMSchemasPlugin(Star):
 
         items.sort(key=lambda t: self._all_sort_key(t[1]))
 
-        sub_imgs = [Image.open(BytesIO(b)).convert("RGB") for _, _, b in items]
+        sub_imgs: list[Image.Image] = []
+        try:
+            for _, _, b in items:
+                sub_imgs.append(Image.open(BytesIO(b)).convert("RGB"))
 
-        PAD = 24
-        TITLE_GAP = 16
-        fonts_title = _load_fonts(20)
-        probe = Image.new("RGB", (1, 1))
-        pdraw = ImageDraw.Draw(probe)
-        title = self._all_title_text(word, race_header, len(items))
-        title_lines = title.split("\n")
-        line_widths: list[int] = []
-        line_bots: list[int] = []
-        for ln in title_lines:
-            lw, _, lbot = self._measure(pdraw, ln, fonts_title)
-            line_widths.append(lw)
-            line_bots.append(lbot)
-        LINE_GAP = 4
-        title_h = sum(line_bots) + LINE_GAP * (len(title_lines) - 1)
-        title_w = max(line_widths) if line_widths else 0
+            PAD = 24
+            TITLE_GAP = 16
+            fonts_title = _load_fonts(20)
+            probe = Image.new("RGB", (1, 1))
+            pdraw = ImageDraw.Draw(probe)
+            title = self._all_title_text(word, race_header, len(items))
+            title_lines = title.split("\n")
+            line_widths: list[int] = []
+            line_bots: list[int] = []
+            for ln in title_lines:
+                lw, _, lbot = self._measure(pdraw, ln, fonts_title)
+                line_widths.append(lw)
+                line_bots.append(lbot)
+            LINE_GAP = 4
+            title_h = sum(line_bots) + LINE_GAP * (len(title_lines) - 1)
+            title_w = max(line_widths) if line_widths else 0
 
-        GAP = 16
-        body_w = max(im.width for im in sub_imgs)
-        IMG_W = max(body_w, PAD * 2 + title_w)
-        body_h = sum(im.height for im in sub_imgs) + GAP * (len(sub_imgs) - 1)
-        IMG_H = PAD + title_h + TITLE_GAP + body_h
+            GAP = 16
+            body_w = max(im.width for im in sub_imgs)
+            IMG_W = max(body_w, PAD * 2 + title_w)
+            body_h = sum(im.height for im in sub_imgs) + GAP * (len(sub_imgs) - 1)
+            IMG_H = PAD + title_h + TITLE_GAP + body_h
 
-        canvas = Image.new("RGB", (IMG_W, IMG_H), (255, 255, 255))
-        draw = ImageDraw.Draw(canvas)
-        ty = PAD
-        for ln, lbot in zip(title_lines, line_bots):
-            _render_text_with_fallback(draw, (PAD, ty), ln, fonts_title, (30, 30, 30))
-            ty += lbot + LINE_GAP
-        y = PAD + title_h + TITLE_GAP
-        for im in sub_imgs:
-            canvas.paste(im, (0, y))
-            y += im.height + GAP
+            canvas = Image.new("RGB", (IMG_W, IMG_H), (255, 255, 255))
+            draw = ImageDraw.Draw(canvas)
+            ty = PAD
+            for ln, lbot in zip(title_lines, line_bots):
+                _render_text_with_fallback(draw, (PAD, ty), ln, fonts_title, (30, 30, 30))
+                ty += lbot + LINE_GAP
+            y = PAD + title_h + TITLE_GAP
+            for im in sub_imgs:
+                canvas.paste(im, (0, y))
+                y += im.height + GAP
 
-        return self._to_png_bytes(canvas)
+            result = self._to_png_bytes(canvas)
+            probe.close()
+            canvas.close()
+            return result
+        finally:
+            for im in sub_imgs:
+                im.close()
 
     def _make_all_summary_image(self, word: str, schema_names: list[str], force_single: bool = False, race_header: Optional[str] = None) -> bytes:
         """>10 字符：每个方案一行，仅展示 来源 / 码长 / 选重 / 缺字 / 当量。"""
@@ -1983,27 +1992,33 @@ class IMSchemasPlugin(Star):
     ) -> bytes:
         """all 组反查：为每个方案生成反查图，竖向拼接。"""
         sub_imgs: list[Image.Image] = []
-        for name in schema_names:
-            info = self._schema_info(name)
-            if not info:
-                continue
-            png = self._make_reverse_image(
-                name, codes, info["owner_id"], info["owner_alias"], info["select_keys"], decorate=False,
-            )
-            sub_imgs.append(Image.open(BytesIO(png)).convert("RGB"))
+        try:
+            for name in schema_names:
+                info = self._schema_info(name)
+                if not info:
+                    continue
+                png = self._make_reverse_image(
+                    name, codes, info["owner_id"], info["owner_alias"], info["select_keys"], decorate=False,
+                )
+                sub_imgs.append(Image.open(BytesIO(png)).convert("RGB"))
 
-        if not sub_imgs:
-            return self._make_all_empty_image(" ".join(codes))
+            if not sub_imgs:
+                return self._make_all_empty_image(" ".join(codes))
 
-        GAP = 16
-        IMG_W = max(im.width for im in sub_imgs)
-        IMG_H = sum(im.height for im in sub_imgs) + GAP * (len(sub_imgs) - 1)
-        canvas = Image.new("RGB", (IMG_W, IMG_H), (255, 255, 255))
-        y = 0
-        for im in sub_imgs:
-            canvas.paste(im, (0, y))
-            y += im.height + GAP
-        return self._to_png_bytes(canvas)
+            GAP = 16
+            IMG_W = max(im.width for im in sub_imgs)
+            IMG_H = sum(im.height for im in sub_imgs) + GAP * (len(sub_imgs) - 1)
+            canvas = Image.new("RGB", (IMG_W, IMG_H), (255, 255, 255))
+            y = 0
+            for im in sub_imgs:
+                canvas.paste(im, (0, y))
+                y += im.height + GAP
+            result = self._to_png_bytes(canvas)
+            canvas.close()
+            return result
+        finally:
+            for im in sub_imgs:
+                im.close()
 
     def _make_schemas_list_image(self, schemas: list[tuple[str, str, str]]) -> bytes:
         """渲染所有词提名图片：首行统计，正文为「词提名（来源）、…」自动换行。"""
