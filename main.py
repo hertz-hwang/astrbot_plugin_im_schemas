@@ -83,20 +83,34 @@ def _ensure_font_cmaps_loaded() -> None:
         _FONT_CMAPS_INITIALIZED = True
 
 
-@lru_cache(maxsize=16)
+_FONT_CACHE: dict[int, tuple[ImageFont.FreeTypeFont, ...]] = {}
+_FONT_CACHE_LOCK = threading.Lock()
+
+
 def _load_fonts(size: int) -> tuple[ImageFont.FreeTypeFont, ...]:
     """按优先级加载所有可用字体，返回 Pillow 字体元组。
-    用 lru_cache 缓存，避免每次画图都重新读取字体文件（每个字号都要 IO）。"""
-    _ensure_font_cmaps_loaded()
-    fonts: list[ImageFont.FreeTypeFont] = []
-    for _, p in _FONT_CMAPS:
-        try:
-            fonts.append(ImageFont.truetype(str(p), size))
-        except Exception:
-            pass
-    if not fonts:
-        fonts.append(ImageFont.load_default())
-    return tuple(fonts)
+    使用手动缓存而非 lru_cache，以便在字体加载失败后能够重试。"""
+    if size in _FONT_CACHE:
+        return _FONT_CACHE[size]
+
+    with _FONT_CACHE_LOCK:
+        # Double-check after acquiring lock
+        if size in _FONT_CACHE:
+            return _FONT_CACHE[size]
+
+        _ensure_font_cmaps_loaded()
+        fonts: list[ImageFont.FreeTypeFont] = []
+        for _, p in _FONT_CMAPS:
+            try:
+                fonts.append(ImageFont.truetype(str(p), size))
+            except Exception:
+                pass
+        if not fonts:
+            fonts.append(ImageFont.load_default())
+
+        result = tuple(fonts)
+        _FONT_CACHE[size] = result
+        return result
 
 
 def _pick_font_idx(ch: str) -> int:
