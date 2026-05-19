@@ -14,15 +14,9 @@ import aiohttp
 try:
     from fontTools.ttLib import TTCollection, TTFont
 except ImportError:
-    import importlib
-    import subprocess
-    import sys
-    subprocess.check_call([sys.executable, "-m", "pip", "install", "fonttools>=4.0.0"])
-    importlib.invalidate_caches()
-    for key in list(sys.modules.keys()):
-        if "fonttools" in key.lower() or "fontTools" in key:
-            del sys.modules[key]
-    from fontTools.ttLib import TTCollection, TTFont
+    raise ImportError(
+        "fonttools>=4.0.0 is required. Please install it with: pip install fonttools>=4.0.0"
+    ) from None
 from PIL import Image, ImageDraw, ImageFilter, ImageFont
 
 from astrbot.api import logger
@@ -116,7 +110,11 @@ def _pick_font_idx(ch: str) -> int:
 
 
 def _pick_font(ch: str, fonts) -> ImageFont.FreeTypeFont:
-    return fonts[_pick_font_idx(ch)] if fonts else fonts[0]
+    """选择字体，确保 fonts 非空时返回有效字体。"""
+    if not fonts:
+        return ImageFont.load_default()
+    idx = _pick_font_idx(ch)
+    return fonts[idx] if idx < len(fonts) else fonts[0]
 
 
 @lru_cache(maxsize=8)
@@ -133,13 +131,12 @@ def _ref_ascent(fonts: tuple) -> int:
 def _char_bbox(size: int, font_idx: int, ch: str) -> tuple[int, int, int, int]:
     fonts = _load_fonts(size)
     f = fonts[font_idx] if font_idx < len(fonts) else fonts[0]
-    # 用一次性 probe draw 测量；ImageDraw.textbbox 不依赖底图大小
-    return _PROBE_DRAW.textbbox((0, 0), ch, font=f, anchor="ls")
-
-
-# 模块级共享 probe，供 _char_bbox 测量使用
-_PROBE_IMG = Image.new("RGB", (1, 1))
-_PROBE_DRAW = ImageDraw.Draw(_PROBE_IMG)
+    # 创建临时 probe 进行测量，避免共享可变状态
+    probe = Image.new("RGB", (1, 1))
+    probe_draw = ImageDraw.Draw(probe)
+    bbox = probe_draw.textbbox((0, 0), ch, font=f, anchor="ls")
+    probe.close()
+    return bbox
 
 
 def _char_advance(size: int, ch: str) -> tuple[int, int, int, int]:
@@ -854,9 +851,8 @@ class IMSchemasPlugin(Star):
 
             # 词组候选：长度 ≥2 且不跨越 passthrough（force_single 时跳过）
             if force_single:
-                limit = i  # 跳过下面的 for 循环
-            else:
-                limit = min(n, i + max_word_len)
+                continue
+            limit = min(n, i + max_word_len)
             for j in range(i + 2, limit + 1):
                 if passthrough[j - 1]:
                     break
