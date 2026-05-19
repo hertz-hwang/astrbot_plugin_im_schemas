@@ -2,7 +2,9 @@ import json
 import re
 import sqlite3
 import string
+import threading
 import unicodedata
+from contextlib import contextmanager
 from functools import lru_cache
 from io import BytesIO
 from pathlib import Path
@@ -469,6 +471,7 @@ def _pair_equivalence_avg(key_seq: str) -> Optional[float]:
 
 
 _DB_INITIALIZED = False
+_DB_LOCK = threading.Lock()
 
 
 def _init_db(conn: sqlite3.Connection) -> None:
@@ -484,13 +487,23 @@ def _init_db(conn: sqlite3.Connection) -> None:
 
     conn.execute("""
         CREATE TABLE IF NOT EXISTS schemas (
-            name        TEXT PRIMARY KEY,
-            owner_id    TEXT NOT NULL,
-            select_keys TEXT NOT NULL DEFAULT '',
-            max_len     INTEGER NOT NULL DEFAULT 4,
-            punct_key   TEXT NOT NULL DEFAULT ''
+            name         TEXT PRIMARY KEY,
+            owner_id     TEXT NOT NULL,
+            owner_alias  TEXT NOT NULL DEFAULT '',
+            select_keys  TEXT NOT NULL DEFAULT '',
+            max_len      INTEGER NOT NULL DEFAULT 4,
+            punct_key    TEXT NOT NULL DEFAULT ''
         )
     """)
+    # 迁移：旧库可能缺少 owner_alias 列
+    cols = {
+        row[1]
+        for row in conn.execute("PRAGMA table_info(schemas)").fetchall()
+    }
+    if "owner_alias" not in cols:
+        conn.execute(
+            "ALTER TABLE schemas ADD COLUMN owner_alias TEXT NOT NULL DEFAULT ''"
+        )
     conn.execute("""
         CREATE TABLE IF NOT EXISTS codes (
             schema_name TEXT NOT NULL,
@@ -507,15 +520,21 @@ def _init_db(conn: sqlite3.Connection) -> None:
     )
 
 
-def _open_db() -> sqlite3.Connection:
+@contextmanager
+def _open_db():
+    """Context manager for database connections with automatic initialization and cleanup."""
     global _DB_INITIALIZED
     conn = sqlite3.connect(DB_PATH)
     # per-connection PRAGMA：WAL 下默认 synchronous=FULL，调到 NORMAL 减少 fsync。
     conn.execute("PRAGMA synchronous = NORMAL")
-    if not _DB_INITIALIZED:
-        _init_db(conn)
-        _DB_INITIALIZED = True
-    return conn
+    try:
+        with _DB_LOCK:
+            if not _DB_INITIALIZED:
+                _init_db(conn)
+                _DB_INITIALIZED = True
+        yield conn
+    finally:
+        conn.close()
 
 
 class Segment(NamedTuple):
@@ -559,28 +578,30 @@ class IMSchemasPlugin(Star):
     # ── 数据库操作 ──────────────────────────────────────────────────────────
 
     def _schema_exists(self, name: str) -> bool:
-        conn = _open_db()
-        row = conn.execute(
-            "SELECT 1 FROM schemas WHERE name = ?", (name,)
-        ).fetchone()
-        conn.close()
-        return row is not None
+        with _open_db() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM schemas WHERE name = ?", (name,)
+            ).fetchone()
+            return row is not None
 
     def _schema_owner(self, name: str) -> Optional[str]:
-        conn = _open_db()
-        row = conn.execute(
-            "SELECT owner_id FROM schemas WHERE name = ?", (name,)
-        ).fetchone()
-        conn.close()
-        return row[0] if row else None
+        with _open_db() as conn:
+            row = conn.execute(
+                "SELECT owner_id FROM schemas WHERE name = ?", (name,)
+            ).fetchone()
+            return row[0] if row else None
+
+    @staticmethod
+    def _display_owner(owner_id: str, owner_alias: str) -> str:
+        """返回用于展示的来源：有别名用别名，否则用 owner_id。"""
+        return owner_alias if owner_alias else owner_id
 
     def _count_user_schemas(self, owner_id: str) -> int:
-        conn = _open_db()
-        row = conn.execute(
-            "SELECT COUNT(*) FROM schemas WHERE owner_id = ?", (owner_id,)
-        ).fetchone()
-        conn.close()
-        return int(row[0]) if row else 0
+        with _open_db() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) FROM schemas WHERE owner_id = ?", (owner_id,)
+            ).fetchone()
+            return int(row[0]) if row else 0
 
     def _import_schema(
         self,
@@ -594,60 +615,63 @@ class IMSchemasPlugin(Star):
         若同名词提已存在，仅刷新 owner_id 与码表条目，
         保留用户先前通过「设置词提」配置的三项参数。
         """
-        conn = _open_db()
-        conn.execute(
-            """
-            INSERT INTO schemas(name, owner_id, select_keys, max_len, punct_key)
-            VALUES (?, ?, ?, ?, ?)
-            ON CONFLICT(name) DO UPDATE SET
-                owner_id = excluded.owner_id
-            """,
-            (name, owner_id, DEFAULT_SELECT_KEYS, DEFAULT_MAX_LEN, ""),
-        )
-        conn.execute("DELETE FROM codes WHERE schema_name = ?", (name,))
-        conn.executemany(
-            "INSERT INTO codes(schema_name, code, word) VALUES (?, ?, ?)",
-            [(name, code, word) for code, word in entries],
-        )
-        conn.commit()
-        count = conn.execute(
-            "SELECT COUNT(*) FROM codes WHERE schema_name = ?", (name,)
-        ).fetchone()[0]
-        # 把更新过程中产生的空 page 归还 OS，避免文件单调膨胀。
-        conn.execute("PRAGMA incremental_vacuum")
-        conn.close()
-        return count
+        with _open_db() as conn:
+            conn.execute(
+                """
+                INSERT INTO schemas(name, owner_id, select_keys, max_len, punct_key)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(name) DO UPDATE SET
+                    owner_id = excluded.owner_id
+                """,
+                (name, owner_id, DEFAULT_SELECT_KEYS, DEFAULT_MAX_LEN, ""),
+            )
+            conn.execute("DELETE FROM codes WHERE schema_name = ?", (name,))
+            conn.executemany(
+                "INSERT INTO codes(schema_name, code, word) VALUES (?, ?, ?)",
+                [(name, code, word) for code, word in entries],
+            )
+            conn.commit()
+            count = conn.execute(
+                "SELECT COUNT(*) FROM codes WHERE schema_name = ?", (name,)
+            ).fetchone()[0]
+            # 把更新过程中产生的空 page 归还 OS，避免文件单调膨胀。
+            conn.execute("PRAGMA incremental_vacuum")
+            return count
 
     def _update_schema_setting(self, name: str, field: str, value) -> None:
-        """更新单个词提配置字段（select_keys / max_len / punct_key）。"""
-        if field not in ("select_keys", "max_len", "punct_key"):
+        """更新单个词提配置字段（select_keys / max_len / punct_key / owner_alias）。"""
+        field_map = {
+            "select_keys": "select_keys",
+            "max_len": "max_len",
+            "punct_key": "punct_key",
+            "来源": "owner_alias",
+        }
+        db_field = field_map.get(field)
+        if db_field is None:
             raise ValueError(f"unsupported schema field: {field}")
-        conn = _open_db()
-        conn.execute(
-            f"UPDATE schemas SET {field} = ? WHERE name = ?",
-            (value, name),
-        )
-        conn.commit()
-        conn.close()
+        with _open_db() as conn:
+            conn.execute(
+                f"UPDATE schemas SET {db_field} = ? WHERE name = ?",
+                (value, name),
+            )
+            conn.commit()
 
     def _delete_schema(self, name: str) -> None:
-        conn = _open_db()
-        conn.execute("DELETE FROM codes WHERE schema_name = ?", (name,))
-        conn.execute("DELETE FROM schemas WHERE name = ?", (name,))
-        conn.commit()
-        conn.execute("PRAGMA incremental_vacuum")
-        conn.close()
+        with _open_db() as conn:
+            conn.execute("DELETE FROM codes WHERE schema_name = ?", (name,))
+            conn.execute("DELETE FROM schemas WHERE name = ?", (name,))
+            conn.commit()
+            conn.execute("PRAGMA incremental_vacuum")
 
     def _max_word_len(self, schema_name: str) -> int:
         """该方案中最长词组的字数；用于限制 DP 候选子串长度。"""
-        conn = _open_db()
-        row = conn.execute(
-            "SELECT MAX(LENGTH(word)) FROM codes WHERE schema_name = ?",
-            (schema_name,),
-        ).fetchone()
-        conn.close()
-        # SQLite LENGTH 对 UTF-8 字符串返回字符数（非字节数），可直接用
-        return int(row[0]) if row and row[0] else 1
+        with _open_db() as conn:
+            row = conn.execute(
+                "SELECT MAX(LENGTH(word)) FROM codes WHERE schema_name = ?",
+                (schema_name,),
+            ).fetchone()
+            # SQLite LENGTH 对 UTF-8 字符串返回字符数（非字节数），可直接用
+            return int(row[0]) if row and row[0] else 1
 
     def _query_word_codes(
         self, schema_name: str, words: list[str]
@@ -659,55 +683,52 @@ class IMSchemasPlugin(Star):
         if not unique_words:
             return {}
 
-        conn = _open_db()
+        with _open_db() as conn:
+            def _fetch_in(sql_tpl: str, items: list[str]) -> list[tuple]:
+                CHUNK = 500
+                out: list[tuple] = []
+                for i in range(0, len(items), CHUNK):
+                    batch = items[i:i + CHUNK]
+                    placeholders = ",".join("?" * len(batch))
+                    out.extend(conn.execute(
+                        sql_tpl.format(ph=placeholders),
+                        (schema_name, *batch),
+                    ).fetchall())
+                return out
 
-        def _fetch_in(sql_tpl: str, items: list[str]) -> list[tuple]:
-            CHUNK = 500
-            out: list[tuple] = []
-            for i in range(0, len(items), CHUNK):
-                batch = items[i:i + CHUNK]
-                placeholders = ",".join("?" * len(batch))
-                out.extend(conn.execute(
-                    sql_tpl.format(ph=placeholders),
-                    (schema_name, *batch),
-                ).fetchall())
-            return out
+            rows = _fetch_in(
+                "SELECT word, code FROM codes WHERE schema_name = ? AND word IN ({ph})",
+                unique_words,
+            )
 
-        rows = _fetch_in(
-            "SELECT word, code FROM codes WHERE schema_name = ? AND word IN ({ph})",
-            unique_words,
-        )
+            best_code: dict[str, str] = {}
+            for w, code in rows:
+                cur = best_code.get(w)
+                if cur is None or (len(code), code) < (len(cur), cur):
+                    best_code[w] = code
 
-        best_code: dict[str, str] = {}
-        for w, code in rows:
-            cur = best_code.get(w)
-            if cur is None or (len(code), code) < (len(cur), cur):
-                best_code[w] = code
+            if not best_code:
+                return {}
 
-        if not best_code:
-            conn.close()
-            return {}
+            unique_codes = list(set(best_code.values()))
+            rows = _fetch_in(
+                "SELECT code, word FROM codes WHERE schema_name = ? AND code IN ({ph}) ORDER BY rowid",
+                unique_codes,
+            )
 
-        unique_codes = list(set(best_code.values()))
-        rows = _fetch_in(
-            "SELECT code, word FROM codes WHERE schema_name = ? AND code IN ({ph}) ORDER BY rowid",
-            unique_codes,
-        )
-        conn.close()
+            words_by_code: dict[str, list[str]] = {}
+            for code, w in rows:
+                words_by_code.setdefault(code, []).append(w)
 
-        words_by_code: dict[str, list[str]] = {}
-        for code, w in rows:
-            words_by_code.setdefault(code, []).append(w)
-
-        result: dict[str, tuple[str, int, int]] = {}
-        for w, code in best_code.items():
-            words_for_code = words_by_code.get(code, [])
-            try:
-                pos = words_for_code.index(w) + 1
-            except ValueError:
-                pos = 1
-            result[w] = (code, pos, len(words_for_code))
-        return result
+            result: dict[str, tuple[str, int, int]] = {}
+            for w, code in best_code.items():
+                words_for_code = words_by_code.get(code, [])
+                try:
+                    pos = words_for_code.index(w) + 1
+                except ValueError:
+                    pos = 1
+                result[w] = (code, pos, len(words_for_code))
+            return result
 
     def _query_segments(
         self,
@@ -850,51 +871,48 @@ class IMSchemasPlugin(Star):
         return segs
 
     def _query_codes(self, schema_name: str, word: str) -> list[str]:
-        conn = _open_db()
-        rows = conn.execute(
-            """
-            SELECT code FROM codes
-            WHERE schema_name = ? AND word = ?
-            ORDER BY length(code), code
-            """,
-            (schema_name, word),
-        ).fetchall()
-        conn.close()
-        return [r[0] for r in rows]
-
-    def _query_codes_with_positions(self, schema_name: str, word: str) -> list[tuple[str, int]]:
-        conn = _open_db()
-        codes = [
-            r[0] for r in conn.execute(
-                "SELECT code FROM codes WHERE schema_name = ? AND word = ? ORDER BY length(code), code",
+        with _open_db() as conn:
+            rows = conn.execute(
+                """
+                SELECT code FROM codes
+                WHERE schema_name = ? AND word = ?
+                ORDER BY length(code), code
+                """,
                 (schema_name, word),
             ).fetchall()
-        ]
-        if not codes:
-            conn.close()
-            return []
+            return [r[0] for r in rows]
 
-        # 批量取这些 code 下的所有同码字词，一次 SQL 解决
-        placeholders = ",".join("?" * len(codes))
-        rows = conn.execute(
-            f"SELECT code, word FROM codes WHERE schema_name = ? AND code IN ({placeholders}) ORDER BY rowid",
-            (schema_name, *codes),
-        ).fetchall()
-        conn.close()
+    def _query_codes_with_positions(self, schema_name: str, word: str) -> list[tuple[str, int]]:
+        with _open_db() as conn:
+            codes = [
+                r[0] for r in conn.execute(
+                    "SELECT code FROM codes WHERE schema_name = ? AND word = ? ORDER BY length(code), code",
+                    (schema_name, word),
+                ).fetchall()
+            ]
+            if not codes:
+                return []
 
-        words_by_code: dict[str, list[str]] = {}
-        for code, w in rows:
-            words_by_code.setdefault(code, []).append(w)
+            # 批量取这些 code 下的所有同码字词，一次 SQL 解决
+            placeholders = ",".join("?" * len(codes))
+            rows = conn.execute(
+                f"SELECT code, word FROM codes WHERE schema_name = ? AND code IN ({placeholders}) ORDER BY rowid",
+                (schema_name, *codes),
+            ).fetchall()
 
-        result: list[tuple[str, int]] = []
-        for code in codes:
-            words_for_code = words_by_code.get(code, [])
-            try:
-                pos = words_for_code.index(word) + 1
-            except ValueError:
-                pos = 1
-            result.append((code, pos))
-        return result
+            words_by_code: dict[str, list[str]] = {}
+            for code, w in rows:
+                words_by_code.setdefault(code, []).append(w)
+
+            result: list[tuple[str, int]] = []
+            for code in codes:
+                words_for_code = words_by_code.get(code, [])
+                try:
+                    pos = words_for_code.index(word) + 1
+                except ValueError:
+                    pos = 1
+                result.append((code, pos))
+            return result
 
     def _lookup_by_code(
         self, schema_name: str, codes: list[str]
@@ -904,54 +922,51 @@ class IMSchemasPlugin(Star):
         unique_codes = list({c for c in codes if c})
         if not unique_codes:
             return {}
-        conn = _open_db()
-        out: dict[str, list[str]] = {c: [] for c in unique_codes}
-        CHUNK = 500
-        for i in range(0, len(unique_codes), CHUNK):
-            batch = unique_codes[i:i + CHUNK]
-            placeholders = ",".join("?" * len(batch))
-            rows = conn.execute(
-                f"SELECT code, word FROM codes WHERE schema_name = ? AND code IN ({placeholders}) ORDER BY rowid",
-                (schema_name, *batch),
-            ).fetchall()
-            for code, word in rows:
-                out[code].append(word)
-        conn.close()
-        return out
+        with _open_db() as conn:
+            out: dict[str, list[str]] = {c: [] for c in unique_codes}
+            CHUNK = 500
+            for i in range(0, len(unique_codes), CHUNK):
+                batch = unique_codes[i:i + CHUNK]
+                placeholders = ",".join("?" * len(batch))
+                rows = conn.execute(
+                    f"SELECT code, word FROM codes WHERE schema_name = ? AND code IN ({placeholders}) ORDER BY rowid",
+                    (schema_name, *batch),
+                ).fetchall()
+                for code, word in rows:
+                    out[code].append(word)
+            return out
 
-    def _list_all_schemas(self) -> list[tuple[str, str]]:
-        """返回所有词提的 (name, owner_id) 列表，按 name 字典序。"""
-        conn = _open_db()
-        rows = conn.execute(
-            "SELECT name, owner_id FROM schemas ORDER BY name"
-        ).fetchall()
-        conn.close()
-        return [(r[0], r[1]) for r in rows]
+    def _list_all_schemas(self) -> list[tuple[str, str, str]]:
+        """返回所有词提的 (name, owner_id, owner_alias) 列表，按 name 字典序。"""
+        with _open_db() as conn:
+            rows = conn.execute(
+                "SELECT name, owner_id, owner_alias FROM schemas ORDER BY name"
+            ).fetchall()
+            return [(r[0], r[1], r[2]) for r in rows]
 
     def _schema_info(self, name: str) -> Optional[dict]:
-        conn = _open_db()
-        row = conn.execute(
-            "SELECT owner_id, select_keys, max_len, punct_key FROM schemas WHERE name = ?",
-            (name,),
-        ).fetchone()
-        if not row:
-            conn.close()
-            return None
-        owner_id, select_keys, max_len, punct_key = row
-        chars_rows = conn.execute(
-            "SELECT DISTINCT code FROM codes WHERE schema_name = ?", (name,)
-        ).fetchall()
-        conn.close()
-        chars: set[str] = set()
-        for (code,) in chars_rows:
-            chars.update(code)
-        return {
-            "owner_id": owner_id,
-            "select_keys": select_keys or DEFAULT_SELECT_KEYS,
-            "max_len": max_len,
-            "punct_key": punct_key,
-            "chars": "".join(sorted(chars)),
-        }
+        with _open_db() as conn:
+            row = conn.execute(
+                "SELECT owner_id, owner_alias, select_keys, max_len, punct_key FROM schemas WHERE name = ?",
+                (name,),
+            ).fetchone()
+            if not row:
+                return None
+            owner_id, owner_alias, select_keys, max_len, punct_key = row
+            chars_rows = conn.execute(
+                "SELECT DISTINCT code FROM codes WHERE schema_name = ?", (name,)
+            ).fetchall()
+            chars: set[str] = set()
+            for (code,) in chars_rows:
+                chars.update(code)
+            return {
+                "owner_id": owner_id,
+                "owner_alias": owner_alias,
+                "select_keys": select_keys or DEFAULT_SELECT_KEYS,
+                "max_len": max_len,
+                "punct_key": punct_key,
+                "chars": "".join(sorted(chars)),
+            }
 
     # ── 解析 TSV 码表 ───────────────────────────────────────────────────────
 
@@ -1132,7 +1147,7 @@ class IMSchemasPlugin(Star):
         gh = bot_off - (ref_asc + min_above)
         return w, gh, bot_off
 
-    def _make_image(self, schema_name: str, word: str, owner_id: str, max_len: int, select_keys: str, force_single: bool = False, show_keyboard: bool = True, decorate: bool = True) -> bytes:
+    def _make_image(self, schema_name: str, word: str, owner_id: str, owner_alias: str, max_len: int, select_keys: str, force_single: bool = False, show_keyboard: bool = True, decorate: bool = True) -> bytes:
         if len(word) == 1:
             codes_with_pos = self._query_codes_with_positions(schema_name, word)
             # 末位为选重键的条目，按选重键位序覆盖 pos
@@ -1140,9 +1155,9 @@ class IMSchemasPlugin(Star):
                 (code, _explicit_select_pos(code, select_keys) or pos)
                 for code, pos in codes_with_pos
             ]
-            return self._make_single_char_image(schema_name, word, codes_with_pos, owner_id, max_len, select_keys, decorate=decorate)
+            return self._make_single_char_image(schema_name, word, codes_with_pos, owner_id, owner_alias, max_len, select_keys, decorate=decorate)
         segments = self._query_segments(schema_name, word, max_len, select_keys, force_single=force_single)
-        return self._make_multi_char_image(schema_name, word, segments, owner_id, max_len, select_keys, show_keyboard=show_keyboard, decorate=decorate)
+        return self._make_multi_char_image(schema_name, word, segments, owner_id, owner_alias, max_len, select_keys, show_keyboard=show_keyboard, decorate=decorate)
 
     def _compute_stats(
         self,
@@ -1215,6 +1230,7 @@ class IMSchemasPlugin(Star):
         word: str,
         codes_with_pos: list[tuple[str, int]],
         owner_id: str,
+        owner_alias: str,
         max_len: int,
         select_keys: str,
         decorate: bool = True,
@@ -1257,7 +1273,7 @@ class IMSchemasPlugin(Star):
         missing_placeholder = "??????"
         char_w, char_gh, char_bot = msr(word, fonts_char)
         info1 = f"方案: {schema_name}"
-        info2 = f"来源: {owner_id}"
+        info2 = f"来源: {self._display_owner(owner_id, owner_alias)}"
         i1w, i1gh, _ = msr(info1, fonts_info)
         i2w, i2gh, _ = msr(info2, fonts_info)
         dafa_label = "打法:"
@@ -1384,6 +1400,7 @@ class IMSchemasPlugin(Star):
         word: str,
         segments: list[Segment],
         owner_id: str,
+        owner_alias: str,
         max_len: int,
         select_keys: str,
         show_keyboard: bool = True,
@@ -1455,7 +1472,7 @@ class IMSchemasPlugin(Star):
         line2 = f"【{schema_name}】"
         eq_str = f"{equivalence:.6f}" if equivalence is not None else "--"
         spd_str = f"{six_speed:.2f}" if six_speed is not None else "--"
-        line3 = f"来源: {owner_id}        字数: {len(chars)}        缺字: {missing}"
+        line3 = f"来源: {self._display_owner(owner_id, owner_alias)}        字数: {len(chars)}        缺字: {missing}"
         line4 = f"码长: {avg_len:.6f}        选重: {sel_count}        当量: {eq_str}"
         line5 = f"六击速度: {spd_str}"
 
@@ -1624,7 +1641,7 @@ class IMSchemasPlugin(Star):
                 continue
             segments = self._query_segments(name, word, info["max_len"], info["select_keys"], force_single=force_single)
             stats = self._compute_stats(word, segments, info["max_len"], info["select_keys"])
-            png = self._make_image(name, word, info["owner_id"], info["max_len"], info["select_keys"], force_single=force_single, show_keyboard=False, decorate=False)
+            png = self._make_image(name, word, info["owner_id"], info["owner_alias"], info["max_len"], info["select_keys"], force_single=force_single, show_keyboard=False, decorate=False)
             items.append((name, stats, png))
 
         if not items:
@@ -1682,6 +1699,7 @@ class IMSchemasPlugin(Star):
             rows_data.append({
                 "name": name,
                 "owner_id": info["owner_id"],
+                "owner_alias": info["owner_alias"],
                 **stats,
             })
 
@@ -1721,7 +1739,7 @@ class IMSchemasPlugin(Star):
             spd = d["six_speed"]
             return [
                 d["name"],
-                d["owner_id"],
+                self._display_owner(d["owner_id"], d.get("owner_alias", "")),
                 f"{d['avg_len']:.6f}",
                 str(d["sel_count"]),
                 str(d["missing"]),
@@ -1799,6 +1817,7 @@ class IMSchemasPlugin(Star):
         schema_name: str,
         codes: list[str],
         owner_id: str,
+        owner_alias: str,
         select_keys: str,
         decorate: bool = True,
     ) -> bytes:
@@ -1828,7 +1847,7 @@ class IMSchemasPlugin(Star):
 
         lookup = self._lookup_by_code(schema_name, uniq_codes)
 
-        title = f"【{schema_name}】反查　来源: {owner_id}"
+        title = f"【{schema_name}】反查　来源: {self._display_owner(owner_id, owner_alias)}"
         _, _, tbot = msr(title, fonts_title)
 
         DEFAULT_COLOR = (40, 40, 40)
@@ -1935,7 +1954,7 @@ class IMSchemasPlugin(Star):
             if not info:
                 continue
             png = self._make_reverse_image(
-                name, codes, info["owner_id"], info["select_keys"], decorate=False,
+                name, codes, info["owner_id"], info["owner_alias"], info["select_keys"], decorate=False,
             )
             sub_imgs.append(Image.open(BytesIO(png)).convert("RGB"))
 
@@ -1952,7 +1971,7 @@ class IMSchemasPlugin(Star):
             y += im.height + GAP
         return self._to_png_bytes(canvas)
 
-    def _make_schemas_list_image(self, schemas: list[tuple[str, str]]) -> bytes:
+    def _make_schemas_list_image(self, schemas: list[tuple[str, str, str]]) -> bytes:
         """渲染所有词提名图片：首行统计，正文为「词提名（来源）、…」自动换行。"""
         PAD = 24
         fonts_title = _load_fonts(20)
@@ -1964,10 +1983,10 @@ class IMSchemasPlugin(Star):
         def msr(text, fonts):
             return self._measure(pdraw, text, fonts)
 
-        owner_count = len({owner for _, owner in schemas})
+        owner_count = len({owner for _, owner, _ in schemas})
         title = f"共 {len(schemas)} 个词提，来自 {owner_count} 个来源"
 
-        items = [f"{name}（{owner}）" for name, owner in schemas]
+        items = [f"{name}（{self._display_owner(owner, alias)}）" for name, owner, alias in schemas]
         sep = "、"
 
         MAX_IMG_W = 1200
@@ -2161,6 +2180,10 @@ class IMSchemasPlugin(Star):
 
     @filter.regex(r"^(?:@\S+\s+)*\S+(?:\s+(?:.+))?$")
     async def cmd_query(self, event: AstrMessageEvent):
+        """
+        用法：查询方案打法，发送
+          [词提名] <字词>或文本
+        """
         text = event.message_str.strip()
         # 引用回复时，QQ 客户端会在消息开头自动追加 `@对方` 提及，剥离后再做查询匹配
         text = re.sub(r"^(?:@\S+\s+)+", "", text)
@@ -2209,7 +2232,7 @@ class IMSchemasPlugin(Star):
                         else:
                             info = self._schema_info(rev_name)
                             img_bytes = self._make_reverse_image(
-                                rev_name, rest_tokens, info["owner_id"], info["select_keys"]
+                                rev_name, rest_tokens, info["owner_id"], info["owner_alias"], info["select_keys"]
                             )
                     except Exception as e:
                         logger.exception(f"[im_schemas] 生成反查图片失败: {e}")
@@ -2308,7 +2331,7 @@ class IMSchemasPlugin(Star):
                 return
 
         try:
-            img_bytes = self._make_image(schema_name, word, info["owner_id"], info["max_len"], info["select_keys"], force_single=force_single)
+            img_bytes = self._make_image(schema_name, word, info["owner_id"], info["owner_alias"], info["max_len"], info["select_keys"], force_single=force_single)
         except Exception as e:
             logger.exception(f"[im_schemas] 生成查询图片失败: {e}")
             yield event.plain_result(
@@ -2321,6 +2344,10 @@ class IMSchemasPlugin(Star):
 
     @filter.regex(r"^%(\S+)$")
     async def cmd_info(self, event: AstrMessageEvent):
+        """
+        用法：查询方案信息，发送
+          %[词提名]
+        """
         text = event.message_str.strip()
         m = re.match(r"^%(\S+)$", text)
         if not m:
@@ -2342,6 +2369,10 @@ class IMSchemasPlugin(Star):
 
     @filter.command("所有词提")
     async def cmd_list_all(self, event: AstrMessageEvent):
+        """
+        用法：查询服务器中所有的词提，发送
+          khkh所有词提
+        """
         schemas = self._list_all_schemas()
         try:
             img_bytes = self._make_schemas_list_image(schemas)
@@ -2359,13 +2390,15 @@ class IMSchemasPlugin(Star):
         用法：khkh设置词提 [词提名] 选重键=...
               khkh设置词提 [词提名] 最大长度=N
               khkh设置词提 [词提名] 标点引导键=...
+              khkh设置词提 [词提名] 来源=别名
 
         每次仅修改一项，未设置的项保持原值。
         """
         usage = (
             "用法：khkh设置词提 [词提名] 选重键=...\n"
             "      khkh设置词提 [词提名] 最大长度=N\n"
-            "      khkh设置词提 [词提名] 标点引导键=..."
+            "      khkh设置词提 [词提名] 标点引导键=...\n"
+            "      khkh设置词提 [词提名] 来源=别名"
         )
         args_str = event.message_str.strip()
         if args_str.startswith("设置词提"):
@@ -2413,6 +2446,10 @@ class IMSchemasPlugin(Star):
             self._update_schema_setting(schema_name, "punct_key", value)
             shown = value if value else "（无）"
             yield event.plain_result(f"词提「{schema_name}」标点引导键已更新为：{shown}")
+        elif key == "来源":
+            self._update_schema_setting(schema_name, "来源", value)
+            shown = value if value else "（无）"
+            yield event.plain_result(f"词提「{schema_name}」来源别名已更新为：{shown}")
         else:
             yield event.plain_result(
                 f"未知设置项「{key}」。\n{usage}"
@@ -2422,6 +2459,10 @@ class IMSchemasPlugin(Star):
 
     @filter.command("删除词提")
     async def cmd_delete(self, event: AstrMessageEvent):
+        """
+        用法：删除某个词提码表，发送
+          删除词提 [词提名]
+        """
         schema_name = event.message_str.strip()
         if schema_name.startswith("删除词提"):
             schema_name = schema_name[len("删除词提"):].strip()
