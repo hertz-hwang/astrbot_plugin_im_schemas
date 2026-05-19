@@ -722,18 +722,24 @@ class IMSchemasPlugin(Star):
         with _SCHEMA_NAMES_CACHE_LOCK:
             _SCHEMA_NAMES_CACHE.discard(name)
 
-    def _max_word_len(self, schema_name: str) -> int:
+    def _max_word_len(self, schema_name: str, conn: Optional[sqlite3.Connection] = None) -> int:
         """该方案中最长词组的字数；用于限制 DP 候选子串长度。"""
-        with _open_db() as conn:
+        if conn is None:
+            with _open_db() as conn:
+                row = conn.execute(
+                    "SELECT MAX(LENGTH(word)) FROM codes WHERE schema_name = ?",
+                    (schema_name,),
+                ).fetchone()
+        else:
             row = conn.execute(
                 "SELECT MAX(LENGTH(word)) FROM codes WHERE schema_name = ?",
                 (schema_name,),
             ).fetchone()
-            # SQLite LENGTH 对 UTF-8 字符串返回字符数（非字节数），可直接用
-            return int(row[0]) if row and row[0] else 1
+        # SQLite LENGTH 对 UTF-8 字符串返回字符数（非字节数），可直接用
+        return int(row[0]) if row and row[0] else 1
 
     def _query_word_codes(
-        self, schema_name: str, words: list[str]
+        self, schema_name: str, words: list[str], conn: Optional[sqlite3.Connection] = None
     ) -> dict[str, tuple[str, int, int]]:
         """批量查询任意词（含单字与词组）的最优 (code, pos, candidate_count)。
         最优定义：编码长度最短，相同长度按 code 字典序最小。
@@ -742,22 +748,60 @@ class IMSchemasPlugin(Star):
         if not unique_words:
             return {}
 
-        with _open_db() as conn:
-            def _fetch_in(sql_tpl: str, items: list[str]) -> list[tuple]:
-                CHUNK = 500
-                out: list[tuple] = []
-                for i in range(0, len(items), CHUNK):
-                    batch = items[i:i + CHUNK]
-                    placeholders = ",".join("?" * len(batch))
-                    out.extend(conn.execute(
-                        sql_tpl.format(ph=placeholders),
-                        (schema_name, *batch),
-                    ).fetchall())
-                return out
+        def _fetch_in_with_conn(sql_tpl: str, items: list[str], c: sqlite3.Connection) -> list[tuple]:
+            CHUNK = 500
+            out: list[tuple] = []
+            for i in range(0, len(items), CHUNK):
+                batch = items[i:i + CHUNK]
+                placeholders = ",".join("?" * len(batch))
+                out.extend(c.execute(
+                    sql_tpl.format(ph=placeholders),
+                    (schema_name, *batch),
+                ).fetchall())
+            return out
 
-            rows = _fetch_in(
+        if conn is None:
+            with _open_db() as conn:
+                rows = _fetch_in_with_conn(
+                    "SELECT word, code FROM codes WHERE schema_name = ? AND word IN ({ph})",
+                    unique_words,
+                    conn,
+                )
+
+                best_code: dict[str, str] = {}
+                for w, code in rows:
+                    cur = best_code.get(w)
+                    if cur is None or (len(code), code) < (len(cur), cur):
+                        best_code[w] = code
+
+                if not best_code:
+                    return {}
+
+                unique_codes = list(set(best_code.values()))
+                rows = _fetch_in_with_conn(
+                    "SELECT code, word FROM codes WHERE schema_name = ? AND code IN ({ph}) ORDER BY rowid",
+                    unique_codes,
+                    conn,
+                )
+
+                words_by_code: dict[str, list[str]] = {}
+                for code, w in rows:
+                    words_by_code.setdefault(code, []).append(w)
+
+                result: dict[str, tuple[str, int, int]] = {}
+                for w, code in best_code.items():
+                    words_for_code = words_by_code.get(code, [])
+                    try:
+                        pos = words_for_code.index(w) + 1
+                    except ValueError:
+                        pos = 1
+                    result[w] = (code, pos, len(words_for_code))
+                return result
+        else:
+            rows = _fetch_in_with_conn(
                 "SELECT word, code FROM codes WHERE schema_name = ? AND word IN ({ph})",
                 unique_words,
+                conn,
             )
 
             best_code: dict[str, str] = {}
@@ -770,9 +814,10 @@ class IMSchemasPlugin(Star):
                 return {}
 
             unique_codes = list(set(best_code.values()))
-            rows = _fetch_in(
+            rows = _fetch_in_with_conn(
                 "SELECT code, word FROM codes WHERE schema_name = ? AND code IN ({ph}) ORDER BY rowid",
                 unique_codes,
+                conn,
             )
 
             words_by_code: dict[str, list[str]] = {}
@@ -813,120 +858,123 @@ class IMSchemasPlugin(Star):
 
         chars = list(word)
         passthrough = [_is_passthrough(c) for c in chars]
-        max_word_len = 1 if force_single else self._max_word_len(schema_name)
 
-        # 收集所有候选子串：
-        # - 单字候选：所有 chars[i:i+1]，含 passthrough 字符（若码表中有定义可用）
-        # - 词组候选：长度 ≥2 且不跨越 passthrough 边界（passthrough 字符不参与组词）
-        candidates: set[str] = set()
-        for i in range(n):
-            candidates.add(word[i:i + 1])
-            if passthrough[i] or force_single:
-                continue
-            limit = min(n, i + max_word_len)
-            for j in range(i + 2, limit + 1):
-                if passthrough[j - 1]:
-                    break
-                candidates.add(word[i:j])
+        # Use a single connection for both queries
+        with _open_db() as conn:
+            max_word_len = 1 if force_single else self._max_word_len(schema_name, conn)
 
-        codes = self._query_word_codes(schema_name, list(candidates))
-        # 码表里若直接收录了末位为选重键的条目（如 aa;），用末位键覆盖 pos，
-        # 让后续渲染/统计自然把它当作选重处理。
-        codes = {
-            w: ((code, _explicit_select_pos(code, select_keys) or pos, cnt))
-            for w, (code, pos, cnt) in codes.items()
-        }
-
-        INF = float("inf")
-        # dp[i] = 处理前 i 个字符的最少按键数；choice[i] = (start, segment) 用于回溯
-        dp: list[float] = [INF] * (n + 1)
-        choice: list[Optional[tuple[int, Segment]]] = [None] * (n + 1)
-        dp[0] = 0.0
-
-        for i in range(n):
-            if dp[i] == INF:
-                continue
-            ch = chars[i]
-            had_any = False
-
-            # 单字（含 passthrough 字符）：先试码表
-            single_hit = codes.get(ch)
-            if single_hit is not None:
-                code, pos, cnt = single_hit
-                seg = Segment(
-                    text=ch, code=code, pos=pos,
-                    is_self_coded=False, is_missing=False, candidate_count=cnt,
-                )
-                cost = dp[i] + _key_presses(code, max_len, pos, select_keys)
-                if cost < dp[i + 1]:
-                    dp[i + 1] = cost
-                    choice[i + 1] = (i, seg)
-                had_any = True
-
-            # passthrough 自编码兜底（无论是否同时有码表条目，自编码 1 键也参与比较）
-            if passthrough[i]:
-                seg = Segment(
-                    text=ch, code=None, pos=1,
-                    is_self_coded=True, is_missing=False,
-                )
-                cost = dp[i] + 1
-                if cost < dp[i + 1]:
-                    dp[i + 1] = cost
-                    choice[i + 1] = (i, seg)
-                had_any = True
-                # passthrough 不参与组词
-                continue
-
-            # 词组候选：长度 ≥2 且不跨越 passthrough（force_single 时跳过）
-            if force_single:
-                continue
-            limit = min(n, i + max_word_len)
-            for j in range(i + 2, limit + 1):
-                if passthrough[j - 1]:
-                    break
-                sub = word[i:j]
-                hit = codes.get(sub)
-                if hit is None:
+            # 收集所有候选子串：
+            # - 单字候选：所有 chars[i:i+1]，含 passthrough 字符（若码表中有定义可用）
+            # - 词组候选：长度 ≥2 且不跨越 passthrough 边界（passthrough 字符不参与组词）
+            candidates: set[str] = set()
+            for i in range(n):
+                candidates.add(word[i:i + 1])
+                if passthrough[i] or force_single:
                     continue
-                code, pos, cnt = hit
-                seg = Segment(
-                    text=sub, code=code, pos=pos,
-                    is_self_coded=False, is_missing=False, candidate_count=cnt,
-                )
-                cost = dp[i] + _key_presses(code, max_len, pos, select_keys)
-                if cost < dp[j]:
-                    dp[j] = cost
-                    choice[j] = (i, seg)
-                had_any = True
+                limit = min(n, i + max_word_len)
+                for j in range(i + 2, limit + 1):
+                    if passthrough[j - 1]:
+                        break
+                    candidates.add(word[i:j])
 
-            # 缺字兜底：保证 dp 总能推进；缺字不计入码长，cost 不增加
-            if not had_any:
-                seg = Segment(
-                    text=ch, code=None, pos=1,
-                    is_self_coded=False, is_missing=True,
-                )
-                cost = dp[i]
-                if cost < dp[i + 1]:
-                    dp[i + 1] = cost
-                    choice[i + 1] = (i, seg)
+            codes = self._query_word_codes(schema_name, list(candidates), conn)
+            # 码表里若直接收录了末位为选重键的条目（如 aa;），用末位键覆盖 pos，
+            # 让后续渲染/统计自然把它当作选重处理。
+            codes = {
+                w: ((code, _explicit_select_pos(code, select_keys) or pos, cnt))
+                for w, (code, pos, cnt) in codes.items()
+            }
 
-        # 回溯
-        segs: list[Segment] = []
-        idx = n
-        while idx > 0:
-            step = choice[idx]
-            if step is None:
-                segs.append(Segment(
-                    text=word[idx - 1], code=None, pos=1,
-                    is_self_coded=False, is_missing=True,
-                ))
-                idx -= 1
-                continue
-            start, seg = step
-            segs.append(seg)
-            idx = start
-        segs.reverse()
-        return segs
+            INF = float("inf")
+            # dp[i] = 处理前 i 个字符的最少按键数；choice[i] = (start, segment) 用于回溯
+            dp: list[float] = [INF] * (n + 1)
+            choice: list[Optional[tuple[int, Segment]]] = [None] * (n + 1)
+            dp[0] = 0.0
+
+            for i in range(n):
+                if dp[i] == INF:
+                    continue
+                ch = chars[i]
+                had_any = False
+
+                # 单字（含 passthrough 字符）：先试码表
+                single_hit = codes.get(ch)
+                if single_hit is not None:
+                    code, pos, cnt = single_hit
+                    seg = Segment(
+                        text=ch, code=code, pos=pos,
+                        is_self_coded=False, is_missing=False, candidate_count=cnt,
+                    )
+                    cost = dp[i] + _key_presses(code, max_len, pos, select_keys)
+                    if cost < dp[i + 1]:
+                        dp[i + 1] = cost
+                        choice[i + 1] = (i, seg)
+                    had_any = True
+
+                # passthrough 自编码兜底（无论是否同时有码表条目，自编码 1 键也参与比较）
+                if passthrough[i]:
+                    seg = Segment(
+                        text=ch, code=None, pos=1,
+                        is_self_coded=True, is_missing=False,
+                    )
+                    cost = dp[i] + 1
+                    if cost < dp[i + 1]:
+                        dp[i + 1] = cost
+                        choice[i + 1] = (i, seg)
+                    had_any = True
+                    # passthrough 不参与组词
+                    continue
+
+                # 词组候选：长度 ≥2 且不跨越 passthrough（force_single 时跳过）
+                if force_single:
+                    continue
+                limit = min(n, i + max_word_len)
+                for j in range(i + 2, limit + 1):
+                    if passthrough[j - 1]:
+                        break
+                    sub = word[i:j]
+                    hit = codes.get(sub)
+                    if hit is None:
+                        continue
+                    code, pos, cnt = hit
+                    seg = Segment(
+                        text=sub, code=code, pos=pos,
+                        is_self_coded=False, is_missing=False, candidate_count=cnt,
+                    )
+                    cost = dp[i] + _key_presses(code, max_len, pos, select_keys)
+                    if cost < dp[j]:
+                        dp[j] = cost
+                        choice[j] = (i, seg)
+                    had_any = True
+
+                # 缺字兜底：保证 dp 总能推进；缺字不计入码长，cost 不增加
+                if not had_any:
+                    seg = Segment(
+                        text=ch, code=None, pos=1,
+                        is_self_coded=False, is_missing=True,
+                    )
+                    cost = dp[i]
+                    if cost < dp[i + 1]:
+                        dp[i + 1] = cost
+                        choice[i + 1] = (i, seg)
+
+            # 回溯
+            segs: list[Segment] = []
+            idx = n
+            while idx > 0:
+                step = choice[idx]
+                if step is None:
+                    segs.append(Segment(
+                        text=word[idx - 1], code=None, pos=1,
+                        is_self_coded=False, is_missing=True,
+                    ))
+                    idx -= 1
+                    continue
+                start, seg = step
+                segs.append(seg)
+                idx = start
+            segs.reverse()
+            return segs
 
     def _query_codes(self, schema_name: str, word: str) -> list[str]:
         with _open_db() as conn:
