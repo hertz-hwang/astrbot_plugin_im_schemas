@@ -66,6 +66,22 @@ _FONT_CMAPS: list[tuple[frozenset[int], Path]] = []
 _FONT_CMAPS_INITIALIZED = False
 _FONT_CMAPS_LOCK = threading.Lock()
 
+# 自定义字体 cmap 缓存：文件名 → frozenset
+_CUSTOM_CMAP_CACHE: dict[str, frozenset[int]] = {}
+_CUSTOM_CMAP_CACHE_LOCK = threading.Lock()
+
+
+def _get_custom_cmap(font_name: str) -> frozenset[int]:
+    """获取自定义字体的 cmap，带缓存。"""
+    if font_name in _CUSTOM_CMAP_CACHE:
+        return _CUSTOM_CMAP_CACHE[font_name]
+    with _CUSTOM_CMAP_CACHE_LOCK:
+        if font_name in _CUSTOM_CMAP_CACHE:
+            return _CUSTOM_CMAP_CACHE[font_name]
+        cmap = _build_cmap(FONTS_DIR / font_name)
+        _CUSTOM_CMAP_CACHE[font_name] = cmap
+        return cmap
+
 
 def _ensure_font_cmaps_loaded() -> None:
     """延迟初始化字体 cmap，避免模块导入时阻塞。"""
@@ -83,23 +99,30 @@ def _ensure_font_cmaps_loaded() -> None:
         _FONT_CMAPS_INITIALIZED = True
 
 
-_FONT_CACHE: dict[int, tuple[ImageFont.FreeTypeFont, ...]] = {}
+_FONT_CACHE: dict[tuple[int, Optional[str]], tuple[ImageFont.FreeTypeFont, ...]] = {}
 _FONT_CACHE_LOCK = threading.Lock()
 
 
-def _load_fonts(size: int) -> tuple[ImageFont.FreeTypeFont, ...]:
+def _load_fonts(size: int, custom_font: Optional[str] = None) -> tuple[ImageFont.FreeTypeFont, ...]:
     """按优先级加载所有可用字体，返回 Pillow 字体元组。
+    custom_font 非空时在内置字体前插入自定义字体（从 FONTS_DIR 加载）。
     使用手动缓存而非 lru_cache，以便在字体加载失败后能够重试。"""
-    if size in _FONT_CACHE:
-        return _FONT_CACHE[size]
+    cache_key = (size, custom_font)
+    if cache_key in _FONT_CACHE:
+        return _FONT_CACHE[cache_key]
 
     with _FONT_CACHE_LOCK:
-        # Double-check after acquiring lock
-        if size in _FONT_CACHE:
-            return _FONT_CACHE[size]
+        if cache_key in _FONT_CACHE:
+            return _FONT_CACHE[cache_key]
 
         _ensure_font_cmaps_loaded()
         fonts: list[ImageFont.FreeTypeFont] = []
+        if custom_font:
+            custom_path = FONTS_DIR / custom_font
+            try:
+                fonts.append(ImageFont.truetype(str(custom_path), size))
+            except Exception as e:
+                logger.warning(f"[im_schemas] 加载自定义字体失败 {custom_font}: {e}")
         for _, p in _FONT_CMAPS:
             try:
                 fonts.append(ImageFont.truetype(str(p), size))
@@ -109,25 +132,33 @@ def _load_fonts(size: int) -> tuple[ImageFont.FreeTypeFont, ...]:
             fonts.append(ImageFont.load_default())
 
         result = tuple(fonts)
-        _FONT_CACHE[size] = result
+        _FONT_CACHE[cache_key] = result
         return result
 
 
-def _pick_font_idx(ch: str) -> int:
-    """根据 cmap 选择字体下标；找不到返回 0（首字体兜底）。"""
+def _pick_font_idx(ch: str, custom_cmap: Optional[frozenset] = None) -> int:
+    """根据 cmap 选择字体下标；custom_cmap 非空时优先检查（返回 0），
+    再查内置字体（下标从 1 起，因 0 已被自定义字体占用）；找不到返回 0（首字体兜底）。"""
     _ensure_font_cmaps_loaded()
     cp = ord(ch)
+    if custom_cmap is not None:
+        if cp in custom_cmap:
+            return 0
+        for i, (cmap, _) in enumerate(_FONT_CMAPS):
+            if cp in cmap:
+                return i + 1
+        return 1  # fallback to first bundled font
     for i, (cmap, _) in enumerate(_FONT_CMAPS):
         if cp in cmap:
             return i
     return 0
 
 
-def _pick_font(ch: str, fonts) -> ImageFont.FreeTypeFont:
+def _pick_font(ch: str, fonts, custom_cmap: Optional[frozenset] = None) -> ImageFont.FreeTypeFont:
     """选择字体，确保 fonts 非空时返回有效字体。"""
     if not fonts:
         return ImageFont.load_default()
-    idx = _pick_font_idx(ch)
+    idx = _pick_font_idx(ch, custom_cmap)
     return fonts[idx] if idx < len(fonts) else fonts[0]
 
 
@@ -142,8 +173,8 @@ def _ref_ascent(fonts: tuple) -> int:
 # 单字符 bbox 缓存：(size, font_idx, ch) → (left, top, right, bottom)
 # 使用 anchor="ls"，1000 字渲染中重复字符极多，命中率高
 @lru_cache(maxsize=65536)
-def _char_bbox(size: int, font_idx: int, ch: str) -> tuple[int, int, int, int]:
-    fonts = _load_fonts(size)
+def _char_bbox(size: int, font_idx: int, ch: str, custom_font: Optional[str] = None) -> tuple[int, int, int, int]:
+    fonts = _load_fonts(size, custom_font)
     f = fonts[font_idx] if font_idx < len(fonts) else fonts[0]
     # 创建临时 probe 进行测量，避免共享可变状态
     probe = Image.new("RGB", (1, 1))
@@ -153,14 +184,14 @@ def _char_bbox(size: int, font_idx: int, ch: str) -> tuple[int, int, int, int]:
     return bbox
 
 
-def _char_advance(size: int, ch: str) -> tuple[int, int, int, int]:
+def _char_advance(size: int, ch: str, custom_cmap: Optional[frozenset] = None, custom_font: Optional[str] = None) -> tuple[int, int, int, int]:
     """返回 (font_idx, advance_w, bb_top, bb_bottom)，命中字符级缓存。"""
-    fi = _pick_font_idx(ch)
-    bb = _char_bbox(size, fi, ch)
+    fi = _pick_font_idx(ch, custom_cmap)
+    bb = _char_bbox(size, fi, ch, custom_font)
     return fi, bb[2] - bb[0], bb[1], bb[3]
 
 
-def _render_text_with_fallback(draw, pos, text: str, fonts, fill, stroke_width: int = 0, baseline: Optional[int] = None):
+def _render_text_with_fallback(draw, pos, text: str, fonts, fill, stroke_width: int = 0, baseline: Optional[int] = None, custom_cmap: Optional[frozenset] = None, custom_font: Optional[str] = None):
     """逐字符渲染，所有候选字体共享同一条基线，避免 PUA 等回退字体高度不齐。
     复用 _char_bbox 缓存的 advance 宽度，避免每字一次 textbbox。
     stroke_width>0 时用同色描边模拟伪粗体（不改变 advance，仅微涨笔画）。
@@ -170,7 +201,7 @@ def _render_text_with_fallback(draw, pos, text: str, fonts, fill, stroke_width: 
     if baseline is None:
         baseline = y_top + _ref_ascent(fonts)
     for ch in text:
-        fi, adv, _, _ = _char_advance(size, ch)
+        fi, adv, _, _ = _char_advance(size, ch, custom_cmap, custom_font)
         f = fonts[fi] if fi < len(fonts) else fonts[0]
         draw.text(
             (x, baseline), ch, font=f, fill=fill, anchor="ls",
@@ -539,10 +570,11 @@ def _init_db(conn: sqlite3.Connection) -> None:
             owner_alias  TEXT NOT NULL DEFAULT '',
             select_keys  TEXT NOT NULL DEFAULT '',
             max_len      INTEGER NOT NULL DEFAULT 4,
-            punct_key    TEXT NOT NULL DEFAULT ''
+            punct_key    TEXT NOT NULL DEFAULT '',
+            custom_font  TEXT NOT NULL DEFAULT ''
         )
     """)
-    # 迁移：旧库可能缺少 owner_alias 列
+    # 迁移：旧库可能缺少 owner_alias / custom_font 列
     cols = {
         row[1]
         for row in conn.execute("PRAGMA table_info(schemas)").fetchall()
@@ -550,6 +582,10 @@ def _init_db(conn: sqlite3.Connection) -> None:
     if "owner_alias" not in cols:
         conn.execute(
             "ALTER TABLE schemas ADD COLUMN owner_alias TEXT NOT NULL DEFAULT ''"
+        )
+    if "custom_font" not in cols:
+        conn.execute(
+            "ALTER TABLE schemas ADD COLUMN custom_font TEXT NOT NULL DEFAULT ''"
         )
     conn.execute("""
         CREATE TABLE IF NOT EXISTS codes (
@@ -684,12 +720,12 @@ class IMSchemasPlugin(Star):
         with _open_db() as conn:
             conn.execute(
                 """
-                INSERT INTO schemas(name, owner_id, select_keys, max_len, punct_key)
-                VALUES (?, ?, ?, ?, ?)
+                INSERT INTO schemas(name, owner_id, select_keys, max_len, punct_key, custom_font)
+                VALUES (?, ?, ?, ?, ?, ?)
                 ON CONFLICT(name) DO UPDATE SET
                     owner_id = excluded.owner_id
                 """,
-                (name, owner_id, DEFAULT_SELECT_KEYS, DEFAULT_MAX_LEN, ""),
+                (name, owner_id, DEFAULT_SELECT_KEYS, DEFAULT_MAX_LEN, "", ""),
             )
             conn.execute("DELETE FROM codes WHERE schema_name = ?", (name,))
             conn.executemany(
@@ -714,6 +750,7 @@ class IMSchemasPlugin(Star):
             "max_len": "UPDATE schemas SET max_len = ? WHERE name = ?",
             "punct_key": "UPDATE schemas SET punct_key = ? WHERE name = ?",
             "来源": "UPDATE schemas SET owner_alias = ? WHERE name = ?",
+            "PUA": "UPDATE schemas SET custom_font = ? WHERE name = ?",
         }
         sql = QUERIES.get(field)
         if sql is None:
@@ -1032,12 +1069,12 @@ class IMSchemasPlugin(Star):
     def _schema_info(self, name: str) -> Optional[dict]:
         with _open_db() as conn:
             row = conn.execute(
-                "SELECT owner_id, owner_alias, select_keys, max_len, punct_key FROM schemas WHERE name = ?",
+                "SELECT owner_id, owner_alias, select_keys, max_len, punct_key, custom_font FROM schemas WHERE name = ?",
                 (name,),
             ).fetchone()
             if not row:
                 return None
-            owner_id, owner_alias, select_keys, max_len, punct_key = row
+            owner_id, owner_alias, select_keys, max_len, punct_key, custom_font = row
             chars_rows = conn.execute(
                 "SELECT DISTINCT code FROM codes WHERE schema_name = ?", (name,)
             ).fetchall()
@@ -1050,6 +1087,7 @@ class IMSchemasPlugin(Star):
                 "select_keys": select_keys or DEFAULT_SELECT_KEYS,
                 "max_len": max_len,
                 "punct_key": punct_key,
+                "custom_font": custom_font,
                 "chars": "".join(sorted(chars)),
             }
 
@@ -1221,7 +1259,7 @@ class IMSchemasPlugin(Star):
         return buf.getvalue()
 
     @staticmethod
-    def _measure(draw, text: str, fonts) -> tuple[int, int, int]:
+    def _measure(draw, text: str, fonts, custom_cmap: Optional[frozenset] = None, custom_font: Optional[str] = None) -> tuple[int, int, int]:
         """Returns (width, glyph_height, bottom_offset).
         基于统一基线（max ascent）计算，与 _render_text_with_fallback 保持一致：
           baseline = y_top + ref_ascent
@@ -1238,7 +1276,7 @@ class IMSchemasPlugin(Star):
         max_below = 0     # 基线下最远像素
         min_above = 0     # 基线上最近像素（相对基线，负值；0 表示恰好在基线）
         for ch in text:
-            _, adv, top, bot = _char_advance(size, ch)
+            _, adv, top, bot = _char_advance(size, ch, custom_cmap, custom_font)
             w += adv
             if bot > max_below:
                 max_below = bot
@@ -1248,7 +1286,7 @@ class IMSchemasPlugin(Star):
         gh = bot_off - (ref_asc + min_above)
         return w, gh, bot_off
 
-    def _make_image(self, schema_name: str, word: str, owner_id: str, owner_alias: str, max_len: int, select_keys: str, force_single: bool = False, show_keyboard: bool = True, decorate: bool = True) -> bytes:
+    def _make_image(self, schema_name: str, word: str, owner_id: str, owner_alias: str, max_len: int, select_keys: str, force_single: bool = False, show_keyboard: bool = True, decorate: bool = True, custom_font: Optional[str] = None) -> bytes:
         if len(word) == 1:
             codes_with_pos = self._query_codes_with_positions(schema_name, word)
             # 末位为选重键的条目，按选重键位序覆盖 pos
@@ -1256,9 +1294,9 @@ class IMSchemasPlugin(Star):
                 (code, _explicit_select_pos(code, select_keys) or pos)
                 for code, pos in codes_with_pos
             ]
-            return self._make_single_char_image(schema_name, word, codes_with_pos, owner_id, owner_alias, max_len, select_keys, decorate=decorate)
+            return self._make_single_char_image(schema_name, word, codes_with_pos, owner_id, owner_alias, max_len, select_keys, decorate=decorate, custom_font=custom_font)
         segments = self._query_segments(schema_name, word, max_len, select_keys, force_single=force_single)
-        return self._make_multi_char_image(schema_name, word, segments, owner_id, owner_alias, max_len, select_keys, show_keyboard=show_keyboard, decorate=decorate)
+        return self._make_multi_char_image(schema_name, word, segments, owner_id, owner_alias, max_len, select_keys, show_keyboard=show_keyboard, decorate=decorate, custom_font=custom_font)
 
     def _compute_stats(
         self,
@@ -1335,18 +1373,20 @@ class IMSchemasPlugin(Star):
         max_len: int,
         select_keys: str,
         decorate: bool = True,
+        custom_font: Optional[str] = None,
     ) -> bytes:
         PAD = 24
-        fonts_char = _load_fonts(80)
-        fonts_info = _load_fonts(18)
-        fonts_dafa = _load_fonts(16)
-        fonts_dafa_sel = _load_fonts(18)  # 选重码略大一号，更显眼
+        custom_cmap = _get_custom_cmap(custom_font) if custom_font else None
+        fonts_char = _load_fonts(80, custom_font)
+        fonts_info = _load_fonts(18, custom_font)
+        fonts_dafa = _load_fonts(16, custom_font)
+        fonts_dafa_sel = _load_fonts(18, custom_font)  # 选重码略大一号，更显眼
 
         probe = Image.new("RGB", (1, 1))
         pdraw = ImageDraw.Draw(probe)
 
         def msr(text, fonts):
-            return self._measure(pdraw, text, fonts)
+            return self._measure(pdraw, text, fonts, custom_cmap, custom_font)
 
         # Build 打法 string
         # 同时构造分段着色 / 字体列表：每条候选可能是选重（红色 + 略大粗体）或普通
@@ -1409,7 +1449,7 @@ class IMSchemasPlugin(Star):
         draw = ImageDraw.Draw(img)
 
         # Large character
-        _render_text_with_fallback(draw, (PAD, PAD), word, fonts_char, (30, 30, 30))
+        _render_text_with_fallback(draw, (PAD, PAD), word, fonts_char, (30, 30, 30), custom_cmap=custom_cmap, custom_font=custom_font)
 
         # Info block — vertically centred against the char bottom
         info_y = PAD + (top_bot - info_block_h) // 2
@@ -1442,13 +1482,14 @@ class IMSchemasPlugin(Star):
         draw: ImageDraw.ImageDraw,
         origin: tuple[int, int],
         counts: dict[str, int],
+        custom_font: Optional[str] = None,
     ) -> None:
         """在 origin 处绘制一个 13 列宽的 QWERTY 键盘热力图。
         色阶：未按 → 浅灰；按下 → 浅黄到深红的线性渐变（按 max(counts) 归一化）。"""
         x0, y0 = origin
         max_n = max(counts.values(), default=0)
-        fonts_label = _load_fonts(14)
-        fonts_count = _load_fonts(11)
+        fonts_label = _load_fonts(14, custom_font)
+        fonts_count = _load_fonts(11, custom_font)
 
         def heat_color(n: int) -> tuple[int, int, int]:
             if n <= 0 or max_n <= 0:
@@ -1507,19 +1548,21 @@ class IMSchemasPlugin(Star):
         select_keys: str,
         show_keyboard: bool = True,
         decorate: bool = True,
+        custom_font: Optional[str] = None,
     ) -> bytes:
         PAD = 24
         CELL_GAP = 16
-        fonts_stats = _load_fonts(28)
-        fonts_char = _load_fonts(36)
-        fonts_code = _load_fonts(28)
-        fonts_code_sel = _load_fonts(30)  # 选重码略大一号，更显眼
+        custom_cmap = _get_custom_cmap(custom_font) if custom_font else None
+        fonts_stats = _load_fonts(28, custom_font)
+        fonts_char = _load_fonts(36, custom_font)
+        fonts_code = _load_fonts(28, custom_font)
+        fonts_code_sel = _load_fonts(30, custom_font)  # 选重码略大一号，更显眼
 
         probe = Image.new("RGB", (1, 1))
         pdraw = ImageDraw.Draw(probe)
 
         def msr(text, fonts):
-            return self._measure(pdraw, text, fonts)
+            return self._measure(pdraw, text, fonts, custom_cmap, custom_font)
 
         n = len(segments)
 
@@ -1651,7 +1694,7 @@ class IMSchemasPlugin(Star):
             kb_x = IMG_W - PAD - _KEYBOARD_W
             kb_y = PAD + (top_block_h - _KEYBOARD_H) // 2
             counts = _build_key_counts("".join(key_seq_parts))
-            self._draw_keyboard_heatmap(draw, (kb_x, kb_y), counts)
+            self._draw_keyboard_heatmap(draw, (kb_x, kb_y), counts, custom_font=custom_font)
 
         grid_top = PAD + top_block_h + 16
         for r, row in enumerate(rows):
@@ -1707,7 +1750,7 @@ class IMSchemasPlugin(Star):
                     code_color = (10, 10, 10)
 
                 char_x = x + (cell_w - cw) // 2
-                _render_text_with_fallback(draw, (char_x, char_y), seg.text, fonts_char, char_color)
+                _render_text_with_fallback(draw, (char_x, char_y), seg.text, fonts_char, char_color, custom_cmap=custom_cmap, custom_font=custom_font)
 
                 draw.line([(x, ul_y), (x + cell_w, ul_y)], fill=(140, 140, 140), width=1)
 
@@ -1744,7 +1787,7 @@ class IMSchemasPlugin(Star):
                 continue
             segments = self._query_segments(name, word, info["max_len"], info["select_keys"], force_single=force_single)
             stats = self._compute_stats(word, segments, info["max_len"], info["select_keys"])
-            png = self._make_image(name, word, info["owner_id"], info["owner_alias"], info["max_len"], info["select_keys"], force_single=force_single, show_keyboard=False, decorate=False)
+            png = self._make_image(name, word, info["owner_id"], info["owner_alias"], info["max_len"], info["select_keys"], force_single=force_single, show_keyboard=False, decorate=False, custom_font=info.get("custom_font") or None)
             items.append((name, stats, png))
 
         if not items:
@@ -1938,22 +1981,24 @@ class IMSchemasPlugin(Star):
         owner_alias: str,
         select_keys: str,
         decorate: bool = True,
+        custom_font: Optional[str] = None,
     ) -> bytes:
         """编码反查图：列出每个 code 在该方案下对应的字词，按 rowid 顺序给出位序。
         位序 1（首选）默认色，位序 ≥2（选重）用红色与正常查询一致。"""
         PAD = 24
         LINE_GAP = 6
         BLOCK_GAP = 18
-        fonts_title = _load_fonts(20)
-        fonts_code = _load_fonts(26)
-        fonts_word = _load_fonts(22)
-        fonts_info = _load_fonts(16)
+        custom_cmap = _get_custom_cmap(custom_font) if custom_font else None
+        fonts_title = _load_fonts(20, custom_font)
+        fonts_code = _load_fonts(26, custom_font)
+        fonts_word = _load_fonts(22, custom_font)
+        fonts_info = _load_fonts(16, custom_font)
 
         probe = Image.new("RGB", (1, 1))
         pdraw = ImageDraw.Draw(probe)
 
         def msr(text, fonts):
-            return self._measure(pdraw, text, fonts)
+            return self._measure(pdraw, text, fonts, custom_cmap, custom_font)
 
         # 去重保序
         seen: set[str] = set()
@@ -2054,7 +2099,7 @@ class IMSchemasPlugin(Star):
             for row in rows:
                 x = PAD + 16
                 for piece, color in row:
-                    _render_text_with_fallback(draw, (x, y), piece, fonts_word, color)
+                    _render_text_with_fallback(draw, (x, y), piece, fonts_word, color, custom_cmap=custom_cmap, custom_font=custom_font)
                     pw, _, _ = msr(piece, fonts_word)
                     x += pw
                 y += word_bot + LINE_GAP
@@ -2074,7 +2119,7 @@ class IMSchemasPlugin(Star):
                 if not info:
                     continue
                 png = self._make_reverse_image(
-                    name, codes, info["owner_id"], info["owner_alias"], info["select_keys"], decorate=False,
+                    name, codes, info["owner_id"], info["owner_alias"], info["select_keys"], decorate=False, custom_font=info.get("custom_font") or None,
                 )
                 sub_imgs.append(Image.open(BytesIO(png)).convert("RGB"))
 
@@ -2180,7 +2225,8 @@ class IMSchemasPlugin(Star):
                 "  khkh设置词提 [词提名] 来源=[别名]\n"
                 "  khkh设置词提 [词提名] 选重键=_;'4567890\n"
                 "  khkh设置词提 [词提名] 最大长度=4\n"
-                "  khkh设置词提 [词提名] 标点引导键=/"
+                "  khkh设置词提 [词提名] 标点引导键=/\n"
+                "  khkh设置词提 [词提名] PUA=[fonts/目录下完整字体文件名]"
             )
         )
         event.stop_event()
@@ -2291,7 +2337,8 @@ class IMSchemasPlugin(Star):
         yield event.plain_result(
             f"词提「{schema_name}」导入成功！共 {count:,} 条编码。\n"
             f"查询：{schema_name} <字词>\n"
-            f"信息：%{schema_name}"
+            f"信息：%{schema_name}\n"
+            f"如需使用自定义字体，请联系：荒 1121144145"
         )
 
     # ── 查码：[词提名] <字词>，或引用回复+[词提名] ─────────────────────────
@@ -2383,7 +2430,7 @@ class IMSchemasPlugin(Star):
                         else:
                             info = self._schema_info(rev_name)
                             img_bytes = self._make_reverse_image(
-                                rev_name, rest_tokens, info["owner_id"], info["owner_alias"], info["select_keys"]
+                                rev_name, rest_tokens, info["owner_id"], info["owner_alias"], info["select_keys"], custom_font=info.get("custom_font") or None,
                             )
                     except Exception as e:
                         logger.exception(f"[im_schemas] 生成反查图片失败: {e}")
@@ -2482,7 +2529,7 @@ class IMSchemasPlugin(Star):
                 return
 
         try:
-            img_bytes = self._make_image(schema_name, word, info["owner_id"], info["owner_alias"], info["max_len"], info["select_keys"], force_single=force_single)
+            img_bytes = self._make_image(schema_name, word, info["owner_id"], info["owner_alias"], info["max_len"], info["select_keys"], force_single=force_single, custom_font=info.get("custom_font") or None)
         except Exception as e:
             logger.exception(f"[im_schemas] 生成查询图片失败: {e}")
             yield event.plain_result(
@@ -2513,6 +2560,7 @@ class IMSchemasPlugin(Star):
             f"选重键：{info['select_keys']}\n"
             f"最大长度：{info['max_len']}\n"
             f"标点引导键：{info['punct_key'] or '（无）'}\n"
+            f"自定义字体：{info['custom_font'] or '（默认）'}\n"
             f"码元：{info['chars']}"
         )
 
@@ -2542,6 +2590,7 @@ class IMSchemasPlugin(Star):
               khkh设置词提 [词提名] 最大长度=N
               khkh设置词提 [词提名] 标点引导键=...
               khkh设置词提 [词提名] 来源=别名
+              khkh设置词提 [词提名] PUA=字体文件名.ttf
 
         每次仅修改一项，未设置的项保持原值。
         """
@@ -2549,7 +2598,8 @@ class IMSchemasPlugin(Star):
             "用法：khkh设置词提 [词提名] 选重键=...\n"
             "      khkh设置词提 [词提名] 最大长度=N\n"
             "      khkh设置词提 [词提名] 标点引导键=...\n"
-            "      khkh设置词提 [词提名] 来源=别名"
+            "      khkh设置词提 [词提名] 来源=别名\n"
+            "      khkh设置词提 [词提名] PUA=字体文件名.ttf"
         )
         args_str = event.message_str.strip()
         if args_str.startswith("设置词提"):
@@ -2601,6 +2651,24 @@ class IMSchemasPlugin(Star):
             self._update_schema_setting(schema_name, "来源", value)
             shown = value if value else "（无）"
             yield event.plain_result(f"词提「{schema_name}」来源别名已更新为：{shown}")
+        elif key == "PUA":
+            if not event.is_admin():
+                yield event.plain_result("只有管理员才能设置自定义字体。")
+                return
+            if not value:
+                # 清除自定义字体
+                self._update_schema_setting(schema_name, "PUA", "")
+                yield event.plain_result(f"词提「{schema_name}」自定义字体已清除，将使用默认字体。")
+                return
+            if "/" in value or "\\" in value:
+                yield event.plain_result("字体文件名不能包含路径分隔符。")
+                return
+            font_path = FONTS_DIR / value
+            if not font_path.exists():
+                yield event.plain_result(f"字体文件「{value}」不存在，请先将字体文件放入 fonts 目录。")
+                return
+            self._update_schema_setting(schema_name, "PUA", value)
+            yield event.plain_result(f"词提「{schema_name}」自定义字体已更新为：{value}")
         else:
             yield event.plain_result(
                 f"未知设置项「{key}」。\n{usage}"
