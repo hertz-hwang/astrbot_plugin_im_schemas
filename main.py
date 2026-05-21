@@ -1453,12 +1453,12 @@ class IMSchemasPlugin(Star):
 
         # Info block — vertically centred against the char bottom
         info_y = PAD + (top_bot - info_block_h) // 2
-        _render_text_with_fallback(draw, (info_x, info_y), info1, fonts_info, (80, 80, 80))
-        _render_text_with_fallback(draw, (info_x, info_y + i1gh + 8), info2, fonts_info, (80, 80, 80))
+        _render_text_with_fallback(draw, (info_x, info_y), info1, fonts_info, (80, 80, 80), custom_cmap=custom_cmap, custom_font=custom_font)
+        _render_text_with_fallback(draw, (info_x, info_y + i1gh + 8), info2, fonts_info, (80, 80, 80), custom_cmap=custom_cmap, custom_font=custom_font)
 
         # 打法 section
         y = PAD + top_bot + 16
-        _render_text_with_fallback(draw, (PAD, y), dafa_label, fonts_info, (80, 80, 80))
+        _render_text_with_fallback(draw, (PAD, y), dafa_label, fonts_info, (80, 80, 80), custom_cmap=custom_cmap, custom_font=custom_font)
         y += dlbot + 8
         if dafa_str:
             # 共享基线：用最大字号的 ascent 作为基线锚点，混排不同字号也对齐
@@ -1469,10 +1469,11 @@ class IMSchemasPlugin(Star):
                 _render_text_with_fallback(
                     draw, (x, y), piece, pfonts, color,
                     stroke_width=sw, baseline=shared_baseline,
+                    custom_cmap=custom_cmap, custom_font=custom_font,
                 )
                 x += pw
         else:
-            _render_text_with_fallback(draw, (PAD + 8, y), missing_placeholder, fonts_dafa, (180, 60, 220))
+            _render_text_with_fallback(draw, (PAD + 8, y), missing_placeholder, fonts_dafa, (180, 60, 220), custom_cmap=custom_cmap, custom_font=custom_font)
 
         probe.close()
         return self._to_png_bytes(img, decorate=decorate)
@@ -1488,6 +1489,7 @@ class IMSchemasPlugin(Star):
         色阶：未按 → 浅灰；按下 → 浅黄到深红的线性渐变（按 max(counts) 归一化）。"""
         x0, y0 = origin
         max_n = max(counts.values(), default=0)
+        custom_cmap = _get_custom_cmap(custom_font) if custom_font else None
         fonts_label = _load_fonts(14, custom_font)
         fonts_count = _load_fonts(11, custom_font)
 
@@ -1511,17 +1513,19 @@ class IMSchemasPlugin(Star):
             t = (n / max_n) if max_n else 0
             label_color = (255, 255, 255) if t >= 0.55 else (40, 40, 40)
             count_color = (255, 255, 255) if t >= 0.55 else (90, 90, 90)
-            lw, _, lbot = self._measure(draw, label, fonts_label)
+            lw, _, lbot = self._measure(draw, label, fonts_label, custom_cmap, custom_font)
             _render_text_with_fallback(
                 draw, (kx + (kw - lw) // 2, ky + 6),
                 label, fonts_label, label_color,
+                custom_cmap=custom_cmap, custom_font=custom_font,
             )
             count_text = str(n) if n > 0 else ""
             if count_text:
-                cw, _, _ = self._measure(draw, count_text, fonts_count)
+                cw, _, _ = self._measure(draw, count_text, fonts_count, custom_cmap, custom_font)
                 _render_text_with_fallback(
                     draw, (kx + (kw - cw) // 2, ky + kh - 16),
                     count_text, fonts_count, count_color,
+                    custom_cmap=custom_cmap, custom_font=custom_font,
                 )
 
         for r, (indent, row) in enumerate(_QWERTY_ROWS):
@@ -1687,7 +1691,7 @@ class IMSchemasPlugin(Star):
         stats_y = PAD + (top_block_h - STATS_H) // 2 if show_keyboard else PAD
         y = stats_y
         for line in [line1, line2, line3, line4, line5]:
-            _render_text_with_fallback(draw, (PAD, y), line, fonts_stats, (50, 50, 50))
+            _render_text_with_fallback(draw, (PAD, y), line, fonts_stats, (50, 50, 50), custom_cmap=custom_cmap, custom_font=custom_font)
             y += LINE_H
 
         if show_keyboard:
@@ -1758,6 +1762,7 @@ class IMSchemasPlugin(Star):
                 _render_text_with_fallback(
                     draw, (code_x, code_y), code_str, code_fonts, code_color,
                     stroke_width=code_stroke,
+                    custom_cmap=custom_cmap, custom_font=custom_font,
                 )
 
                 x += cell_widths[i]
@@ -2085,15 +2090,16 @@ class IMSchemasPlugin(Star):
         img = Image.new("RGB", (IMG_W, IMG_H), (255, 255, 255))
         draw = ImageDraw.Draw(img)
 
-        _render_text_with_fallback(draw, (PAD, PAD), title, fonts_title, HEAD_COLOR)
+        _render_text_with_fallback(draw, (PAD, PAD), title, fonts_title, HEAD_COLOR, custom_cmap=custom_cmap, custom_font=custom_font)
         y = PAD + tbot + 16
 
         for c, suffix, suffix_color, rows in blocks:
-            _render_text_with_fallback(draw, (PAD, y), c, fonts_code, HEAD_COLOR)
+            _render_text_with_fallback(draw, (PAD, y), c, fonts_code, HEAD_COLOR, custom_cmap=custom_cmap, custom_font=custom_font)
             hw, _, _ = msr(c, fonts_code)
             _render_text_with_fallback(
                 draw, (PAD + hw + 12, y + (code_bot - info_bot)),
                 suffix, fonts_info, suffix_color,
+                custom_cmap=custom_cmap, custom_font=custom_font,
             )
             y += code_bot + 4
             for row in rows:
