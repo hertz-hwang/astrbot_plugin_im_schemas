@@ -2433,11 +2433,7 @@ class IMSchemasPlugin(Star):
             return
 
         # 快速过滤：head 必须是已知词提名或 all 触发词，否则不处理
-        if not (self._is_all_trigger(head) or self._schema_exists(head)):
-            # 检查是否为多词提对比或反查模式
-            if not head.startswith("/"):
-                return
-
+        # 注意：如果带有强制单字引导键前缀，需要先剥离再检查
         prefix_pat = (self.config.get("single_char_prefix", "") or "").strip()
 
         def _strip_force_prefix(token: str) -> tuple[str, bool]:
@@ -2455,6 +2451,13 @@ class IMSchemasPlugin(Star):
             if self._is_all_trigger(stripped) or self._schema_exists(stripped):
                 return stripped, True
             return token, False
+
+        # 先尝试剥离引导键前缀，用于判断 head 是否合法
+        schema_name_for_check, _ = _strip_force_prefix(head)
+        if not (self._is_all_trigger(schema_name_for_check) or self._schema_exists(schema_name_for_check)):
+            # 检查是否为多词提对比或反查模式
+            if not head.startswith("/"):
+                return
 
         schema_name, force_single = _strip_force_prefix(head)
 
