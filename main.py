@@ -395,27 +395,27 @@ def _pure_code_len(code: str, select_keys: str) -> int:
     return len(code)
 
 
-def _code_display(code: str, max_len: int, pos: int = 1, select_keys: str = "") -> str:
+def _key_presses(code: str, max_len: int, pos: int = 1, select_keys: str = "", candidate_count: int = 1) -> int:
     if pos > 1:
         sym = _select_symbol(pos, select_keys)
-        # code 已显式带选重键时不再重复拼接
-        if code.endswith(sym):
-            return code
-        return code + sym
-    if len(code) < max_len:
-        first_key = select_keys[0] if select_keys else "_"
-        return code + first_key
-    return code
-
-
-def _key_presses(code: str, max_len: int, pos: int = 1, select_keys: str = "") -> int:
-    if pos > 1:
-        sym = _select_symbol(pos, select_keys)
-        # code 已显式带选重键时不再多算一键
         if code.endswith(sym):
             return len(code)
         return len(code) + 1
-    return len(code) + (1 if len(code) < max_len else 0)
+    if len(code) < max_len or candidate_count > 1:
+        return len(code) + 1
+    return len(code)
+
+
+def _code_display(code: str, max_len: int, pos: int = 1, select_keys: str = "", candidate_count: int = 1) -> str:
+    if pos > 1:
+        sym = _select_symbol(pos, select_keys)
+        if code.endswith(sym):
+            return code
+        return code + sym
+    if len(code) < max_len or candidate_count > 1:
+        first_key = select_keys[0] if select_keys else "_"
+        return code + first_key
+    return code
 
 
 def _key_presses_last(code: str, max_len: int, pos: int = 1, select_keys: str = "", candidate_count: int = 1) -> int:
@@ -448,17 +448,28 @@ def _omit_in_punct_context(
     pos: int,
     max_len: int,
     select_keys: str,
+    is_punct_follow: bool,
+    candidate_count: int = 1,
 ) -> Optional[tuple[int, str]]:
-    """段后是自编码标点时的省略规则；可省略时返回 (按键数, 显示码串)，否则 None。
-
-    - 首选键省略：pos==1 且 len(code)<max_len，省末位首选键（补齐到 max_len 的尾键不必敲）。
-    - 末位 select_keys 省略：max_len<=0 且码表中条目末位本就是 select_keys 中的字符
-      （含首选键 / 选重键），省末位（max_len<=0 表示作者声明不限码长，标点本身就是上屏触发）。
-    """
-    if pos == 1 and len(code) < max_len:
-        return len(code), code
+    """段后是标点时的省略规则。标点自动上屏后可触发前一段词提首选键省略。"""
+    if pos == 1:
+        if is_punct_follow:
+            return len(code), code
+        if len(code) < max_len and candidate_count == 1:
+            return len(code), code
     if max_len <= 0 and code and select_keys and code[-1] in select_keys:
         return len(code) - 1, code[:-1]
+    return None
+
+
+def _omit_followed_by_word(
+    code: str,
+    pos: int,
+    max_len: int,
+) -> Optional[tuple[int, str]]:
+    """段后是中文字词时的省略规则：pos==1 且 len(code)>=max_len 时省略首选键。"""
+    if pos == 1 and len(code) >= max_len:
+        return len(code), code
     return None
 
 
@@ -921,7 +932,7 @@ class IMSchemasPlugin(Star):
                         text=ch, code=code, pos=pos,
                         is_self_coded=False, is_missing=False, candidate_count=cnt,
                     )
-                    cost = dp[i] + _key_presses(code, max_len, pos, select_keys)
+                    cost = dp[i] + _key_presses(code, max_len, pos, select_keys, cnt)
                     if cost < dp[i + 1]:
                         dp[i + 1] = cost
                         choice[i + 1] = (i, seg)
@@ -957,7 +968,7 @@ class IMSchemasPlugin(Star):
                         text=sub, code=code, pos=pos,
                         is_self_coded=False, is_missing=False, candidate_count=cnt,
                     )
-                    cost = dp[i] + _key_presses(code, max_len, pos, select_keys)
+                    cost = dp[i] + _key_presses(code, max_len, pos, select_keys, cnt)
                     if cost < dp[j]:
                         dp[j] = cost
                         choice[j] = (i, seg)
@@ -1312,6 +1323,9 @@ class IMSchemasPlugin(Star):
         def _next_self_coded(i: int) -> bool:
             return i + 1 < n and segments[i + 1].is_self_coded and _is_punct(segments[i + 1].text)
 
+        def _next_is_word(i: int) -> bool:
+            return i + 1 < n and not segments[i + 1].is_self_coded
+
         per_presses: list[int] = []
         key_seq_parts: list[str] = []
         for i, seg in enumerate(segments):
@@ -1324,7 +1338,7 @@ class IMSchemasPlugin(Star):
                 key_seq_parts.append(seg.text)
             else:
                 code, pos = seg.code, seg.pos
-                omit = _omit_in_punct_context(code, pos, max_len, select_keys) if _next_self_coded(i) else None
+                omit = _omit_in_punct_context(code, pos, max_len, select_keys, True, seg.candidate_count) if _next_self_coded(i) else None
                 if omit is not None:
                     presses, disp = omit
                     per_presses.append(presses)
@@ -1332,9 +1346,19 @@ class IMSchemasPlugin(Star):
                 elif is_last:
                     per_presses.append(_key_presses_last(code, max_len, pos, select_keys, seg.candidate_count))
                     key_seq_parts.append(_code_display_last(code, max_len, pos, select_keys, seg.candidate_count))
+                elif _next_is_word(i):
+                    # 后接中文字词：pos==1 且 len(code)<max_len 时省略首选键
+                    omit = _omit_followed_by_word(code, pos, max_len)
+                    if omit is not None:
+                        presses, disp = omit
+                        per_presses.append(presses)
+                        key_seq_parts.append(disp)
+                    else:
+                        per_presses.append(_key_presses(code, max_len, pos, select_keys, seg.candidate_count))
+                        key_seq_parts.append(_code_display(code, max_len, pos, select_keys, seg.candidate_count))
                 else:
-                    per_presses.append(_key_presses(code, max_len, pos, select_keys))
-                    key_seq_parts.append(_code_display(code, max_len, pos, select_keys))
+                    per_presses.append(_key_presses(code, max_len, pos, select_keys, seg.candidate_count))
+                    key_seq_parts.append(_code_display(code, max_len, pos, select_keys, seg.candidate_count))
 
         missing = sum(len(seg.text) for seg in segments if seg.is_missing)
         sel_count = sum(1 for seg in segments if not seg.is_self_coded and not seg.is_missing and seg.pos > 1)
@@ -1571,8 +1595,11 @@ class IMSchemasPlugin(Star):
         n = len(segments)
 
         def _next_self_coded(i: int) -> bool:
-            # 仅自编码标点会触发前一段的首选键省略；数字/字母不省。
+            # 标点触发前一段的首选键省略；数字/字母/空格不省（由 candidate_count 判断）。
             return i + 1 < n and segments[i + 1].is_self_coded and _is_punct(segments[i + 1].text)
+
+        def _next_is_word(i: int) -> bool:
+            return i + 1 < n and not segments[i + 1].is_self_coded
 
         # 每段按键数 + 显示码串
         per_presses: list[int] = []
@@ -1590,7 +1617,7 @@ class IMSchemasPlugin(Star):
                 key_seq_parts.append(seg.text)
             else:
                 code, pos = seg.code, seg.pos
-                omit = _omit_in_punct_context(code, pos, max_len, select_keys) if _next_self_coded(i) else None
+                omit = _omit_in_punct_context(code, pos, max_len, select_keys, True, seg.candidate_count) if _next_self_coded(i) else None
                 if omit is not None:
                     presses, disp = omit
                     per_presses.append(presses)
@@ -1601,9 +1628,22 @@ class IMSchemasPlugin(Star):
                     disp = _code_display_last(code, max_len, pos, select_keys, seg.candidate_count)
                     cell_codes.append(disp)
                     key_seq_parts.append(disp)
+                elif _next_is_word(i):
+                    # 后接中文字词：pos==1 且 len(code)<max_len 时省略首选键
+                    omit = _omit_followed_by_word(code, pos, max_len)
+                    if omit is not None:
+                        presses, disp = omit
+                        per_presses.append(presses)
+                        cell_codes.append(disp)
+                        key_seq_parts.append(disp)
+                    else:
+                        per_presses.append(_key_presses(code, max_len, pos, select_keys, seg.candidate_count))
+                        disp = _code_display(code, max_len, pos, select_keys, seg.candidate_count)
+                        cell_codes.append(disp)
+                        key_seq_parts.append(disp)
                 else:
-                    per_presses.append(_key_presses(code, max_len, pos, select_keys))
-                    disp = _code_display(code, max_len, pos, select_keys)
+                    per_presses.append(_key_presses(code, max_len, pos, select_keys, seg.candidate_count))
+                    disp = _code_display(code, max_len, pos, select_keys, seg.candidate_count)
                     cell_codes.append(disp)
                     key_seq_parts.append(disp)
 
