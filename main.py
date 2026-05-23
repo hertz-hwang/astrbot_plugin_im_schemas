@@ -938,17 +938,18 @@ class IMSchemasPlugin(Star):
                         choice[i + 1] = (i, seg)
                     had_any = True
 
-                # passthrough 自编码兜底（无论是否同时有码表条目，自编码 1 键也参与比较）
+                # passthrough 自编码兜底：码表中有定义时优先码表，无定义才自编码 1 键
                 if passthrough[i]:
-                    seg = Segment(
-                        text=ch, code=None, pos=1,
-                        is_self_coded=True, is_missing=False,
-                    )
-                    cost = dp[i] + 1
-                    if cost < dp[i + 1]:
-                        dp[i + 1] = cost
-                        choice[i + 1] = (i, seg)
-                    had_any = True
+                    if single_hit is None:
+                        seg = Segment(
+                            text=ch, code=None, pos=1,
+                            is_self_coded=True, is_missing=False,
+                        )
+                        cost = dp[i] + 1
+                        if cost < dp[i + 1]:
+                            dp[i + 1] = cost
+                            choice[i + 1] = (i, seg)
+                        had_any = True
                     # passthrough 不参与组词
                     continue
 
