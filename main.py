@@ -558,6 +558,9 @@ def _pair_equivalence_avg(key_seq: str) -> Optional[float]:
 _DB_INITIALIZED = False
 _DB_LOCK = threading.Lock()
 
+# Per-thread 连接缓存：避免每次查询都新建连接
+_thread_local_db = threading.local()
+
 # Schema name cache: set of all schema names, updated on import/delete
 _SCHEMA_NAMES_CACHE: set[str] = set()
 _SCHEMA_NAMES_CACHE_LOCK = threading.Lock()
@@ -614,21 +617,34 @@ def _init_db(conn: sqlite3.Connection) -> None:
     )
 
 
-@contextmanager
-def _open_db():
-    """Context manager for database connections with automatic initialization and cleanup."""
+def _get_db_conn() -> sqlite3.Connection:
+    """获取当前线程的 SQLite 连接（懒初始化、线程隔离、全局只建表一次）。"""
     global _DB_INITIALIZED
-    conn = sqlite3.connect(DB_PATH)
-    # per-connection PRAGMA：WAL 下默认 synchronous=FULL，调到 NORMAL 减少 fsync。
-    conn.execute("PRAGMA synchronous = NORMAL")
-    try:
+    conn = getattr(_thread_local_db, "conn", None)
+    if conn is None:
+        conn = sqlite3.connect(DB_PATH)
+        # per-connection PRAGMA：WAL 下默认 synchronous=FULL，调到 NORMAL 减少 fsync。
+        conn.execute("PRAGMA synchronous = NORMAL")
         with _DB_LOCK:
             if not _DB_INITIALIZED:
                 _init_db(conn)
                 _DB_INITIALIZED = True
+        _thread_local_db.conn = conn
+    return conn
+
+
+@contextmanager
+def _open_db():
+    """获取线程级 SQLite 连接，退出时如有未提交事务则回滚。
+
+    连接在线程生命周期内复用，不再每次新建。
+    """
+    conn = _get_db_conn()
+    try:
         yield conn
-    finally:
-        conn.close()
+    except BaseException:
+        conn.rollback()
+        raise
 
 
 class Segment(NamedTuple):
