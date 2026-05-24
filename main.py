@@ -561,6 +561,22 @@ _DB_LOCK = threading.Lock()
 # Per-thread 连接缓存：避免每次查询都新建连接
 _thread_local_db = threading.local()
 
+# Placeholder 模板缓存：避免重复生成 "?,?,...??" 字符串
+_PLACEHOLDER_CACHE: dict[int, str] = {}
+_PLACEHOLDER_CACHE_LOCK = threading.Lock()
+
+
+def _placeholders(n: int) -> str:
+    """Return n question marks joined by commas, cached."""
+    if n in _PLACEHOLDER_CACHE:
+        return _PLACEHOLDER_CACHE[n]
+    with _PLACEHOLDER_CACHE_LOCK:
+        if n in _PLACEHOLDER_CACHE:
+            return _PLACEHOLDER_CACHE[n]
+        result = ",".join("?" * n)
+        _PLACEHOLDER_CACHE[n] = result
+        return result
+
 # Schema name cache: set of all schema names, updated on import/delete
 _SCHEMA_NAMES_CACHE: set[str] = set()
 _SCHEMA_NAMES_CACHE_LOCK = threading.Lock()
@@ -832,11 +848,11 @@ class IMSchemasPlugin(Star):
     ) -> dict[str, tuple[str, int, int]]:
         """实现 _query_word_codes 的核心逻辑，接收已打开的连接。"""
         def _fetch_in_with_conn(sql_tpl: str, items: list[str]) -> list[tuple]:
-            CHUNK = 500
+            CHUNK = 100
             out: list[tuple] = []
             for i in range(0, len(items), CHUNK):
                 batch = items[i:i + CHUNK]
-                placeholders = ",".join("?" * len(batch))
+                placeholders = _placeholders(len(batch))
                 out.extend(conn.execute(
                     sql_tpl.format(ph=placeholders),
                     (schema_name, *batch),
@@ -1074,10 +1090,10 @@ class IMSchemasPlugin(Star):
             return {}
         with _open_db() as conn:
             out: dict[str, list[str]] = {c: [] for c in unique_codes}
-            CHUNK = 500
+            CHUNK = 100
             for i in range(0, len(unique_codes), CHUNK):
                 batch = unique_codes[i:i + CHUNK]
-                placeholders = ",".join("?" * len(batch))
+                placeholders = _placeholders(len(batch))
                 rows = conn.execute(
                     f"SELECT code, word FROM codes WHERE schema_name = ? AND code IN ({placeholders}) ORDER BY rowid",
                     (schema_name, *batch),
