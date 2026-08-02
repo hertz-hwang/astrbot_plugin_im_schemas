@@ -9,6 +9,6 @@ help: |
   %[词提名]     — 查看当前码表统计
   khkh所有词提     — 列出所有已上传词提
   khkh删除词提 [词提名]     — 删除当前码表（仅上传者）
-version: v1.0.0
+version: v1.0.1
 author: hertz
 repo: "https://github.com/hertz-hwang/astrbot_plugin_im_schemas"

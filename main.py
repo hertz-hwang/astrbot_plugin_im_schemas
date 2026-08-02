@@ -28,27 +28,50 @@ from astrbot.core import AstrBotConfig
 DATA_DIR = StarTools.get_data_dir("im_data")
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
+
+# ── 文件下载异常分类（便于调用方给出针对性提示）──────────────────────────────
+
+class _DownloadError(Exception):
+    """_download_text 失败时的基类。"""
+
+
+class _UrlExpiredError(_DownloadError):
+    """HTTP 状态码非 200，常见于 QQ 等平台临时文件链接已过期。"""
+
+
+class _EncodingError(_DownloadError):
+    """所有尝试的编码都无法解码文件内容。"""
+
+
+class _NetworkError(_DownloadError):
+    """DNS/SSL/超时/连接等其他网络层异常。"""
+
 DB_PATH = DATA_DIR / "schemas.db"
 
 FONTS_DIR = Path(__file__).parent / "fonts"
 
-# 字体加载顺序：ChaiPUA → SourceHanSansSC → Plangothic，按优先级尝试
+# 字体加载顺序：ChaiPUA → SourceHanSansSC → PlangothicP1 → PlangothicP2
+# Plangothic 原为 TTC 格式，Pillow 只能加载第一个子字体，
+# 故拆分为两个独立 TTF 文件以支持所有字符的回退。
 _BUNDLED_FONTS = [
     FONTS_DIR / "ChaiPUA-0.2.7.ttf",
     FONTS_DIR / "SourceHanSansSC-Regular.otf",
-    FONTS_DIR / "Plangothic.ttc",
+    FONTS_DIR / "PlangothicP1-Regular.ttf",
+    FONTS_DIR / "PlangothicP2-Regular.ttf",
 ]
 
 
 def _build_cmap(font_path: Path) -> frozenset[int]:
-    """读取字体文件的 cmap，返回其覆盖的 Unicode 码位集合。"""
+    """读取字体文件的 cmap，返回其覆盖的 Unicode 码位集合。
+    TTC 文件只取第一个子字体（与 Pillow 行为一致，后续子字体的字符会正确回退到下一种字体）。"""
     codepoints: set[int] = set()
     try:
         suffix = font_path.suffix.lower()
         if suffix == ".ttc":
             col = TTCollection(str(font_path))
-            for tt in col.fonts:
-                cmap = tt.getBestCmap()
+            # 只取第一个子字体，与 Pillowtruetype() 行为一致
+            if col.fonts:
+                cmap = col.fonts[0].getBestCmap()
                 if cmap:
                     codepoints.update(cmap.keys())
         else:
@@ -1165,21 +1188,38 @@ class IMSchemasPlugin(Star):
 
     # ── 文件下载 ────────────────────────────────────────────────────────────
 
-    async def _download_text(self, url: str) -> Optional[str]:
+    async def _download_text(self, url: str) -> str:
+        """下载文本文件并尝试常见编码解码。
+
+        失败时抛出 _DownloadError 子类，便于调用方针对性提示：
+          - _UrlExpiredError: HTTP 非 200，文件链接已失效
+          - _EncodingError:   所有尝试的编码都无法解码
+          - _NetworkError:    DNS/SSL/超时/连接等其他网络异常
+        """
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.get(
                     url, timeout=aiohttp.ClientTimeout(total=30)
                 ) as resp:
+                    if resp.status != 200:
+                        raise _UrlExpiredError(
+                            f"status={resp.status}, url={url}"
+                        )
                     raw = await resp.read()
-            for enc in ("utf-8", "gbk", "utf-16"):
-                try:
-                    return raw.decode(enc)
-                except UnicodeDecodeError:
-                    continue
+        except _UrlExpiredError:
+            raise
         except Exception as e:
-            logger.warning(f"[im_schemas] 下载文件失败: {e}")
-        return None
+            raise _NetworkError(f"{type(e).__name__}: {e}") from e
+
+        for enc in ("utf-8-sig", "utf-8", "gbk", "gb18030", "big5", "utf-16"):
+            try:
+                return raw.decode(enc)
+            except UnicodeDecodeError:
+                continue
+        raise _EncodingError(
+            f"url={url}, size={len(raw)}, "
+            f"tried=utf-8-sig/utf-8/gbk/gb18030/big5/utf-16"
+        )
 
     # ── 图片生成 ────────────────────────────────────────────────────────────
 
@@ -1725,10 +1765,12 @@ class IMSchemasPlugin(Star):
         content_w = sum(cell_widths)
         STATS_KB_GAP = 24
         top_w = (stats_w + STATS_KB_GAP + _KEYBOARD_W) if show_keyboard else stats_w
-        IMG_W = max(min(PAD * 2 + content_w, MAX_IMG_W), PAD * 2 + top_w, 400)
-        row_max_w = IMG_W - PAD * 2
+        # 字符行换行宽度固定为 MAX_IMG_W，不随 top_w 膨胀；
+        # IMG_W 取两者较大值，保证顶部 stats/键盘不被裁剪。
+        row_max_w = MAX_IMG_W - PAD * 2
+        IMG_W = max(PAD * 2 + top_w, MAX_IMG_W, 400)
 
-        # 将单元按可用宽度切分成若干行
+        # 将单元按可用宽度切分成若干行；单个 cell 超宽时强制独占一行（不溢出）
         rows: list[list[int]] = []
         cur: list[int] = []
         cur_w = 0
@@ -1740,6 +1782,11 @@ class IMSchemasPlugin(Star):
             else:
                 cur.append(i)
                 cur_w += w
+            # 单个 cell 已超出行宽，立即单独成行，避免溢出
+            if cur_w > row_max_w and len(cur) == 1:
+                rows.append(cur)
+                cur = []
+                cur_w = 0
         if cur:
             rows.append(cur)
 
@@ -2370,7 +2417,7 @@ class IMSchemasPlugin(Star):
 
         file_size = getattr(file_seg, "size", None)
         if file_size is not None and not is_admin:
-            max_size_mb = 50
+            max_size_mb = 100
             max_size_bytes = max_size_mb * 1024 * 1024
             if file_size > max_size_bytes:
                 size_mb = file_size / (1024 * 1024)
@@ -2383,8 +2430,23 @@ class IMSchemasPlugin(Star):
 
         yield event.plain_result("正在下载并解析码表，请稍候…")
 
-        content = await self._download_text(url)
-        if content is None:
+        try:
+            content = await self._download_text(url)
+        except _UrlExpiredError as e:
+            logger.warning(f"[im_schemas] 文件 URL 已失效: {e}")
+            yield event.plain_result(
+                "文件链接已失效，请重新上传文件后再引用此消息。"
+            )
+            return
+        except _EncodingError as e:
+            logger.warning(f"[im_schemas] 无法识别文件编码: {e}")
+            yield event.plain_result(
+                "无法识别文件编码。请确认文件为 utf-8 / gbk / gb18030 / big5 / utf-16 中的一种，"
+                "转换后重新上传。"
+            )
+            return
+        except _NetworkError as e:
+            logger.warning(f"[im_schemas] 下载文件失败: {e}")
             yield event.plain_result("文件下载失败，请检查网络后重试。")
             return
 
