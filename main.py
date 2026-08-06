@@ -50,6 +50,9 @@ DB_PATH = DATA_DIR / "schemas.db"
 
 FONTS_DIR = Path(__file__).parent / "fonts"
 
+# 用户上传文件大小上限（非管理员）。管理员不受此限制。
+MAX_UPLOAD_MB = 100
+
 # 字体加载顺序：ChaiPUA → SourceHanSansSC → PlangothicP1 → PlangothicP2
 # Plangothic 原为 TTC 格式，Pillow 只能加载第一个子字体，
 # 故拆分为两个独立 TTF 文件以支持所有字符的回退。
@@ -1477,6 +1480,54 @@ class IMSchemasPlugin(Star):
             f"tried=utf-8-sig/utf-8/gbk/gb18030/big5/utf-16"
         )
 
+    async def _get_remote_size(self, url: str) -> Optional[int]:
+        """通过 HEAD 请求获取远程文件的字节大小。
+
+        用于弥补消息段 `file_seg.size` 缺失（QQ / napcat 等平台的常见情况），
+        在下载前给出明确的「文件过大」提示，而不是含糊的「网络失败」。
+
+        部分服务器不支持 HEAD 或返回 405，此时回退到 Range GET（bytes=0-0），
+        从 Content-Range / Content-Length 中解析大小。任何网络或解析失败
+        均返回 None，由调用方决定是否放行——保留「fail-open」语义，避免
+        因探测失败而误拦正常文件。
+        """
+        try:
+            async with aiohttp.ClientSession() as session:
+                # 优先 HEAD
+                try:
+                    async with session.head(
+                        url,
+                        timeout=aiohttp.ClientTimeout(total=10),
+                        allow_redirects=True,
+                    ) as resp:
+                        if resp.status == 200:
+                            cl = resp.headers.get("Content-Length")
+                            if cl and cl.isdigit():
+                                return int(cl)
+                except Exception:
+                    pass
+                # 回退：Range GET，只取首字节
+                try:
+                    async with session.get(
+                        url,
+                        timeout=aiohttp.ClientTimeout(total=10),
+                        headers={"Range": "bytes=0-0"},
+                    ) as resp:
+                        if resp.status in (200, 206):
+                            cr = resp.headers.get("Content-Range")
+                            if cr and "/" in cr:
+                                size_str = cr.rsplit("/", 1)[-1]
+                                if size_str.isdigit():
+                                    return int(size_str)
+                            cl = resp.headers.get("Content-Length")
+                            if cl and cl.isdigit():
+                                return int(cl)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        return None
+
     # ── 图片生成 ────────────────────────────────────────────────────────────
 
     @staticmethod
@@ -2827,7 +2878,7 @@ class IMSchemasPlugin(Star):
             )
             return
         schema_name = tokens[0]
-        if len(schema_name) <= 1:
+        if len(schema_name) <= 1 and not event.is_admin():
             yield event.plain_result("词提名不能为单个字符，请使用至少两个字符的名称。")
             return
         if self._freq_exists(schema_name):
@@ -2865,17 +2916,27 @@ class IMSchemasPlugin(Star):
         is_admin = event.is_admin()
 
         file_size = getattr(file_seg, "size", None)
+        if file_size is None:
+            # 消息段未带 size 时（如 QQ / napcat），回退到 HEAD 探测，
+            # 避免大文件绕过上限后报出模糊的「网络失败」。
+            file_size = await self._get_remote_size(url)
         if file_size is not None and not is_admin:
-            max_size_mb = 100
-            max_size_bytes = max_size_mb * 1024 * 1024
+            max_size_bytes = MAX_UPLOAD_MB * 1024 * 1024
             if file_size > max_size_bytes:
                 size_mb = file_size / (1024 * 1024)
                 yield event.plain_result(
-                    f"文件过大！用户上传文件限制在 {max_size_mb}MB 以内，"
+                    f"文件过大！用户上传文件限制在 {MAX_UPLOAD_MB}MB 以内，"
                     f"当前文件大小为 {size_mb:.2f}MB。\n"
                     f"如果需要，请联系管理员上传：荒 1121144145。"
                 )
                 return
+        if file_size is None and not is_admin:
+            # HEAD 探测也失败时保留「放行」语义，但记录一条 warning 以便排障；
+            # 若文件实际超大，会在下载阶段以「网络失败」兜底（行为不变）。
+            logger.warning(
+                f"[im_schemas] 无法获取上传文件大小 url={url}，"
+                f"已跳过大小校验（上限 {MAX_UPLOAD_MB}MB）"
+            )
 
         yield event.plain_result("正在下载并解析码表，请稍候…")
 
@@ -2957,7 +3018,7 @@ class IMSchemasPlugin(Star):
             yield event.plain_result("上传词频仅接受词频名一个参数。")
             return
         freq_name = tokens[0]
-        if len(freq_name) <= 1:
+        if len(freq_name) <= 1 and not event.is_admin():
             yield event.plain_result("词频名不能为单个字符，请使用至少两个字符的名称。")
             return
         if self._schema_exists(freq_name):
@@ -3000,17 +3061,27 @@ class IMSchemasPlugin(Star):
         is_admin = event.is_admin()
 
         file_size = getattr(file_seg, "size", None)
+        if file_size is None:
+            # 消息段未带 size 时（如 QQ / napcat），回退到 HEAD 探测，
+            # 避免大文件绕过上限后报出模糊的「网络失败」。
+            file_size = await self._get_remote_size(url)
         if file_size is not None and not is_admin:
-            max_size_mb = 100
-            max_size_bytes = max_size_mb * 1024 * 1024
+            max_size_bytes = MAX_UPLOAD_MB * 1024 * 1024
             if file_size > max_size_bytes:
                 size_mb = file_size / (1024 * 1024)
                 yield event.plain_result(
-                    f"文件过大！用户上传文件限制在 {max_size_mb}MB 以内，"
+                    f"文件过大！用户上传文件限制在 {MAX_UPLOAD_MB}MB 以内，"
                     f"当前文件大小为 {size_mb:.2f}MB。\n"
                     f"如果需要，请联系管理员上传：荒 1121144145。"
                 )
                 return
+        if file_size is None and not is_admin:
+            # HEAD 探测也失败时保留「放行」语义，但记录一条 warning 以便排障；
+            # 若文件实际超大，会在下载阶段以「网络失败」兜底（行为不变）。
+            logger.warning(
+                f"[im_schemas] 无法获取上传文件大小 url={url}，"
+                f"已跳过大小校验（上限 {MAX_UPLOAD_MB}MB）"
+            )
 
         yield event.plain_result("正在下载并解析词频，请稍候…")
 
@@ -3127,7 +3198,19 @@ class IMSchemasPlugin(Star):
                 logger.exception(f"[im_schemas] 查询词频失败: {e}")
                 yield event.plain_result(f"查询词频「{head}」时出错。")
                 return
-            lines = [f"{w} → {found.get(w, '未收录')}" for w in uniq]
+            # 按查询到的词频降序排列；未收录项统一放在末尾，频率相同则保持用户查询顺序。
+            def _freq_sort_key(word: str) -> tuple[int, float]:
+                value = found.get(word)
+                if value is None:
+                    return (1, 0)
+                try:
+                    return (0, -float(value.replace(",", "")))
+                except (ValueError, TypeError):
+                    # 非数值词频无法参与数值排序，但仍排在已解析的数值之后。
+                    return (0, float("inf"))
+
+            ordered_words = sorted(uniq, key=_freq_sort_key)
+            lines = [f"{w} → {found.get(w, '未收录')}" for w in ordered_words]
             body = f"【{head}】\n" + "\n".join(lines)
             if truncated:
                 body += f"\n（一次最多查询 {_FREQ_QUERY_MAX_WORDS} 个字词，其余已省略）"
