@@ -394,11 +394,25 @@ def _text_difficulty(chars: list[str]) -> tuple[str, object]:
     return label, score
 
 
-def _select_symbol(pos: int, select_keys: str) -> str:
+_PAGE_DOWN_KEY = "="
+
+
+def _select_suffix(pos: int, select_keys: str) -> str:
+    """根据位序返回完整的选重/翻页后缀。
+
+    - pos 在首页内（1..len(select_keys)）：返回 ``select_keys[pos-1]``（单字符）
+    - pos 越过首页：返回 ``"=" * 页数 + select_keys[页内位序]``
+      （例如 ``select_keys="_;'4567890"``、pos=11 → ``"=_"``，pos=35 → ``"===5"``）
+    - select_keys 为空或位序非法：返回 ``"?"`` 兜底
+    """
+    page_size = len(select_keys)
+    if page_size == 0 or pos <= 0:
+        return "?"
     idx = pos - 1
-    if 0 <= idx < len(select_keys):
+    if idx < page_size:
         return select_keys[idx]
-    return "?"
+    page_count, pos_in_page = divmod(idx, page_size)
+    return _PAGE_DOWN_KEY * page_count + select_keys[pos_in_page]
 
 
 def _explicit_select_pos(code: str, select_keys: str) -> Optional[int]:
@@ -411,19 +425,22 @@ def _explicit_select_pos(code: str, select_keys: str) -> Optional[int]:
 
 
 def _pure_code_len(code: str, select_keys: str) -> int:
-    """编码的"纯长度"：末位若是任何 select_keys 字符（首选键或选重键）则扣除。
-    用于按编码长度上色：y_ → 1，nim; → 3，nim → 3，aaaa → 4。"""
+    """编码的"纯长度"：先扣末位 select_keys 字符（首选/选重键），再扣末尾的 "=" 翻页键。
+    用于按编码长度上色：y_ → 1，nim; → 3，nim → 3，aaaa → 4，pppp=_ → 4。"""
+    n = len(code)
     if code and select_keys and code[-1] in select_keys:
-        return len(code) - 1
-    return len(code)
+        n -= 1
+    while n > 0 and code[n - 1] == _PAGE_DOWN_KEY:
+        n -= 1
+    return n
 
 
 def _key_presses(code: str, max_len: int, pos: int = 1, select_keys: str = "", candidate_count: int = 1) -> int:
     if pos > 1:
-        sym = _select_symbol(pos, select_keys)
-        if code.endswith(sym):
+        suffix = _select_suffix(pos, select_keys)
+        if code.endswith(suffix):
             return len(code)
-        return len(code) + 1
+        return len(code) + len(suffix)
     if len(code) < max_len or candidate_count > 1:
         return len(code) + 1
     return len(code)
@@ -431,10 +448,10 @@ def _key_presses(code: str, max_len: int, pos: int = 1, select_keys: str = "", c
 
 def _code_display(code: str, max_len: int, pos: int = 1, select_keys: str = "", candidate_count: int = 1) -> str:
     if pos > 1:
-        sym = _select_symbol(pos, select_keys)
-        if code.endswith(sym):
+        suffix = _select_suffix(pos, select_keys)
+        if code.endswith(suffix):
             return code
-        return code + sym
+        return code + suffix
     if len(code) < max_len or candidate_count > 1:
         first_key = select_keys[0] if select_keys else "_"
         return code + first_key
@@ -444,10 +461,10 @@ def _code_display(code: str, max_len: int, pos: int = 1, select_keys: str = "", 
 def _key_presses_last(code: str, max_len: int, pos: int = 1, select_keys: str = "", candidate_count: int = 1) -> int:
     """末位字词的按键数：打满码（len==max_len）且唯一候选时不需要补首选键。"""
     if pos > 1:
-        sym = _select_symbol(pos, select_keys)
-        if code.endswith(sym):
+        suffix = _select_suffix(pos, select_keys)
+        if code.endswith(suffix):
             return len(code)
-        return len(code) + 1
+        return len(code) + len(suffix)
     if len(code) < max_len or candidate_count > 1:
         return len(code) + 1
     return len(code)
@@ -456,10 +473,10 @@ def _key_presses_last(code: str, max_len: int, pos: int = 1, select_keys: str = 
 def _code_display_last(code: str, max_len: int, pos: int = 1, select_keys: str = "", candidate_count: int = 1) -> str:
     """末位字词的显示码串：打满码（len==max_len）且唯一候选时不补首选键。"""
     if pos > 1:
-        sym = _select_symbol(pos, select_keys)
-        if code.endswith(sym):
+        suffix = _select_suffix(pos, select_keys)
+        if code.endswith(suffix):
             return code
-        return code + sym
+        return code + suffix
     if len(code) < max_len or candidate_count > 1:
         first_key = select_keys[0] if select_keys else "_"
         return code + first_key
@@ -1125,6 +1142,61 @@ class IMSchemasPlugin(Star):
                     out[code].append(word)
             return out
 
+    def _lookup_by_word(
+        self, schema_name: str, words: list[str]
+    ) -> dict[str, list[tuple[str, int]]]:
+        """字词反查：每个唯一 word → 该 word 在方案中的全部 (code, pos)。
+        code 按 (length, code) 排序（最短优先，再字典序）；pos 是同码字词中
+        按 rowid 排序的位序，与上屏行为一致。未命中则列表为空。"""
+        unique_words = list({w for w in words if w})
+        if not unique_words:
+            return {}
+        with _open_db() as conn:
+            CHUNK = 100
+
+            # 1) 取所有 (word, code)，按 (length, code) 排序
+            codes_by_word: dict[str, list[str]] = {}
+            for i in range(0, len(unique_words), CHUNK):
+                batch = unique_words[i:i + CHUNK]
+                placeholders = _placeholders(len(batch))
+                rows = conn.execute(
+                    f"SELECT word, code FROM codes WHERE schema_name = ? AND word IN ({placeholders}) "
+                    f"ORDER BY length(code), code",
+                    (schema_name, *batch),
+                ).fetchall()
+                for w, code in rows:
+                    codes_by_word.setdefault(w, []).append(code)
+
+            if not codes_by_word:
+                return {w: [] for w in unique_words}
+
+            # 2) 取这些 code 下所有同码字词，按 rowid 计算每个候选 code 的 pos
+            all_codes = list({c for cs in codes_by_word.values() for c in cs})
+            words_by_code: dict[str, list[str]] = {}
+            for i in range(0, len(all_codes), CHUNK):
+                batch = all_codes[i:i + CHUNK]
+                placeholders = _placeholders(len(batch))
+                rows = conn.execute(
+                    f"SELECT code, word FROM codes WHERE schema_name = ? AND code IN ({placeholders}) "
+                    f"ORDER BY rowid",
+                    (schema_name, *batch),
+                ).fetchall()
+                for code, w in rows:
+                    words_by_code.setdefault(code, []).append(w)
+
+            out: dict[str, list[tuple[str, int]]] = {}
+            for w in unique_words:
+                items: list[tuple[str, int]] = []
+                for c in codes_by_word.get(w, []):
+                    siblings = words_by_code.get(c, [])
+                    try:
+                        pos = siblings.index(w) + 1
+                    except ValueError:
+                        pos = 1
+                    items.append((c, pos))
+                out[w] = items
+            return out
+
     def _list_all_schemas(self) -> list[tuple[str, str, str]]:
         """返回所有词提的 (name, owner_id, owner_alias) 列表，按 name 字典序。"""
         with _open_db() as conn:
@@ -1499,7 +1571,8 @@ class IMSchemasPlugin(Star):
             if idx > 0:
                 dafa_pieces.append((SEP, DEFAULT_COLOR, fonts_dafa, 0))
             if pos > 1:
-                dafa_pieces.append((piece, SELECT_COLOR, fonts_dafa_sel, 1))
+                # 选重：红色不加粗，加粗反而影响可读性
+                dafa_pieces.append((piece, SELECT_COLOR, fonts_dafa_sel, 0))
             else:
                 dafa_pieces.append((piece, DEFAULT_COLOR, fonts_dafa, 0))
         dafa_str = SEP.join(dafa_parts)
@@ -2267,6 +2340,189 @@ class IMSchemasPlugin(Star):
             for im in sub_imgs:
                 im.close()
 
+    def _make_word_lookup_image(
+        self,
+        schema_name: str,
+        words: list[str],
+        owner_id: str,
+        owner_alias: str,
+        select_keys: str,
+        decorate: bool = True,
+        custom_font: Optional[str] = None,
+    ) -> bytes:
+        """字词反查图：列出每个 word 在该方案下的所有编码（按 length, code 排序）。
+        位序 1（首选）默认色，位序 ≥2（选重）用红色加粗，与正常查询图保持一致。"""
+        PAD = 24
+        LINE_GAP = 6
+        BLOCK_GAP = 18
+        custom_cmap = _get_custom_cmap(custom_font) if custom_font else None
+        fonts_title = _load_fonts(20, custom_font)
+        fonts_word = _load_fonts(26, custom_font)
+        fonts_code = _load_fonts(22, custom_font)
+        fonts_code_sel = _load_fonts(24, custom_font)  # 选重码略大一号，更显眼
+        fonts_info = _load_fonts(16, custom_font)
+
+        probe = Image.new("RGB", (1, 1))
+        pdraw = ImageDraw.Draw(probe)
+
+        def msr(text, fonts):
+            return self._measure(pdraw, text, fonts, custom_cmap, custom_font)
+
+        # 去重保序
+        seen: set[str] = set()
+        uniq_words: list[str] = []
+        for w in words:
+            if w and w not in seen:
+                uniq_words.append(w)
+                seen.add(w)
+
+        lookup = self._lookup_by_word(schema_name, uniq_words)
+
+        title = f"【{schema_name}】字词反查　来源: {self._display_owner(owner_id, owner_alias)}"
+        _, _, tbot = msr(title, fonts_title)
+
+        DEFAULT_COLOR = (40, 40, 40)
+        SELECT_COLOR = (200, 40, 40)
+        HEAD_COLOR = (30, 30, 30)
+        MISS_COLOR = (180, 60, 220)
+        INFO_COLOR = (120, 120, 120)
+        SEP = "  "
+
+        # 估算图宽：取 title / 各 word 头 / 各 code 行的最大宽度
+        MAX_IMG_W = 1200
+        widest = msr(title, fonts_title)[0]
+        for w in uniq_words:
+            codes = lookup.get(w, [])
+            head_text = f"{w}　共 {len(codes)} 个" if codes else f"{w}　（未命中）"
+            widest = max(widest, msr(head_text, fonts_word)[0])
+            if codes:
+                for code, pos in codes:
+                    piece = f"{code}({pos})"
+                    pfonts = fonts_code_sel if pos > 1 else fonts_code
+                    pw, _, _ = msr(piece, pfonts)
+                    widest = max(widest, pw + 16)
+        IMG_W = max(min(MAX_IMG_W, PAD * 2 + widest), 400)
+        avail_w = IMG_W - PAD * 2 - 8
+
+        # 排版：把每个 word 块切成若干行，行内是 (text, color, fonts, stroke_width) 段
+        Row = list[tuple[str, tuple[int, int, int], tuple, int]]
+        blocks: list[tuple[str, str, tuple[int, int, int], list[Row]]] = []
+        for w in uniq_words:
+            codes = lookup.get(w, [])
+            if not codes:
+                head_suffix, suffix_color = "（未命中）", MISS_COLOR
+                rows: list[Row] = []
+            else:
+                head_suffix, suffix_color = f"共 {len(codes)} 个", INFO_COLOR
+                rows = []
+                cur: Row = []
+                cur_w = 0
+                sep_w = msr(SEP, fonts_code)[0]
+                for code, pos in codes:
+                    color = SELECT_COLOR if pos > 1 else DEFAULT_COLOR
+                    pfonts = fonts_code_sel if pos > 1 else fonts_code
+                    sw = 1 if pos > 1 else 0
+                    piece = f"{code}({pos})"
+                    pw, _, _ = msr(piece, pfonts)
+                    add_w = (sep_w if cur else 0) + pw
+                    if cur and cur_w + add_w > avail_w:
+                        rows.append(cur)
+                        cur = [(piece, color, pfonts, sw)]
+                        cur_w = pw
+                    else:
+                        if cur:
+                            cur.append((SEP, DEFAULT_COLOR, fonts_code, 0))
+                            cur_w += sep_w
+                        cur.append((piece, color, pfonts, sw))
+                        cur_w += pw
+                if cur:
+                    rows.append(cur)
+            blocks.append((w, head_suffix, suffix_color, rows))
+
+        _, _, word_bot = msr("中", fonts_word)
+        _, _, code_bot = msr("a", fonts_code)
+        _, _, code_sel_bot = msr("a", fonts_code_sel)
+        _, _, info_bot = msr("a", fonts_info)
+        code_row_bot = max(code_bot, code_sel_bot)
+
+        IMG_H = PAD + tbot + 16
+        for _w, _suf, _sc, rows in blocks:
+            IMG_H += word_bot + 4
+            for _ in rows:
+                IMG_H += code_row_bot + LINE_GAP
+            IMG_H += BLOCK_GAP
+        if blocks:
+            IMG_H -= BLOCK_GAP
+        IMG_H += PAD
+
+        img = Image.new("RGB", (IMG_W, IMG_H), (255, 255, 255))
+        draw = ImageDraw.Draw(img)
+
+        _render_text_with_fallback(draw, (PAD, PAD), title, fonts_title, HEAD_COLOR, custom_cmap=custom_cmap, custom_font=custom_font)
+        y = PAD + tbot + 16
+
+        for w, suffix, suffix_color, rows in blocks:
+            _render_text_with_fallback(draw, (PAD, y), w, fonts_word, HEAD_COLOR, custom_cmap=custom_cmap, custom_font=custom_font)
+            hw, _, _ = msr(w, fonts_word)
+            _render_text_with_fallback(
+                draw, (PAD + hw + 12, y + (word_bot - info_bot)),
+                suffix, fonts_info, suffix_color,
+                custom_cmap=custom_cmap, custom_font=custom_font,
+            )
+            y += word_bot + 4
+            for row in rows:
+                # 共享基线：用 row 中最大字号的 ascent 作为基线锚点，混排也对齐
+                ref_asc = max(_ref_ascent(p[2]) for p in row)
+                shared_baseline = y + ref_asc
+                x = PAD + 16
+                for piece, color, pfonts, sw in row:
+                    _render_text_with_fallback(
+                        draw, (x, y), piece, pfonts, color,
+                        stroke_width=sw, baseline=shared_baseline,
+                        custom_cmap=custom_cmap, custom_font=custom_font,
+                    )
+                    pw, _, _ = msr(piece, pfonts)
+                    x += pw
+                y += code_row_bot + LINE_GAP
+            y += BLOCK_GAP
+
+        probe.close()
+        return self._to_png_bytes(img, decorate=decorate)
+
+    def _make_word_lookup_all_image(
+        self, words: list[str], schema_names: list[str]
+    ) -> bytes:
+        """all 组字词反查：为每个方案生成字词反查图，竖向拼接。"""
+        sub_imgs: list[Image.Image] = []
+        try:
+            for name in schema_names:
+                info = self._schema_info(name)
+                if not info:
+                    continue
+                png = self._make_word_lookup_image(
+                    name, words, info["owner_id"], info["owner_alias"], info["select_keys"],
+                    decorate=False, custom_font=info.get("custom_font") or None,
+                )
+                sub_imgs.append(Image.open(BytesIO(png)).convert("RGB"))
+
+            if not sub_imgs:
+                return self._make_all_empty_image(" ".join(words))
+
+            GAP = 16
+            IMG_W = max(im.width for im in sub_imgs)
+            IMG_H = sum(im.height for im in sub_imgs) + GAP * (len(sub_imgs) - 1)
+            canvas = Image.new("RGB", (IMG_W, IMG_H), (255, 255, 255))
+            y = 0
+            for im in sub_imgs:
+                canvas.paste(im, (0, y))
+                y += im.height + GAP
+            result = self._to_png_bytes(canvas)
+            canvas.close()
+            return result
+        finally:
+            for im in sub_imgs:
+                im.close()
+
     def _make_schemas_list_image(self, schemas: list[tuple[str, str, str]]) -> bytes:
         """渲染所有词提名图片：首行统计，正文为「词提名（来源）、…」自动换行。"""
         PAD = 24
@@ -2551,7 +2807,7 @@ class IMSchemasPlugin(Star):
         schema_name_for_check, _ = _strip_force_prefix(head)
         if not (self._is_all_trigger(schema_name_for_check) or self._schema_exists(schema_name_for_check)):
             # 检查是否为多词提对比或反查模式
-            if not head.startswith("/"):
+            if not (head.startswith("/") or head.startswith("#")):
                 return
 
         schema_name, force_single = _strip_force_prefix(head)
@@ -2580,6 +2836,32 @@ class IMSchemasPlugin(Star):
                         logger.exception(f"[im_schemas] 生成反查图片失败: {e}")
                         yield event.plain_result(
                             f"反查「{' '.join(rest_tokens)}」时渲染图片失败。"
+                        )
+                        return
+                    yield event.chain_result([AstrImage.fromBytes(img_bytes)])
+                    return
+            return
+
+        # 字词反查：#[词提名] <字词1> <字词2> …，或 #[all触发词] <字词1> <字词2> …
+        # 与 `/` 反查对称：head 以 `#` 开头即视为触发；剥离 `#` 后再走 force_single 前缀剥离与词提名校验。
+        if head.startswith("#"):
+            if len(head) > 1:
+                rev_name, _ = _strip_force_prefix(head[1:])
+                is_all = self._is_all_trigger(rev_name)
+                if (is_all or self._schema_exists(rev_name)) and rest_tokens:
+                    try:
+                        if is_all:
+                            schema_names = self._all_group_schemas()
+                            img_bytes = self._make_word_lookup_all_image(rest_tokens, schema_names)
+                        else:
+                            info = self._schema_info(rev_name)
+                            img_bytes = self._make_word_lookup_image(
+                                rev_name, rest_tokens, info["owner_id"], info["owner_alias"], info["select_keys"], custom_font=info.get("custom_font") or None,
+                            )
+                    except Exception as e:
+                        logger.exception(f"[im_schemas] 生成字词反查图片失败: {e}")
+                        yield event.plain_result(
+                            f"字词反查「{' '.join(rest_tokens)}」时渲染图片失败。"
                         )
                         return
                     yield event.chain_result([AstrImage.fromBytes(img_bytes)])
