@@ -10,6 +10,13 @@ help: |
   %[词提名]     — 查看当前码表统计
   khkh所有词提     — 列出所有已上传词提
   khkh删除词提 [词提名]     — 删除当前码表（仅上传者）
-version: v1.0.1
+  ── 词频 ──
+  引用回复 .txt 文件（每行「字词<TAB>词频」）发送 khkh上传词频 [词频名]
+  [词频名] <字词1> [<字词2> ...]  — 查询字词的词频
+  %[词频名]     — 查看词频信息
+  khkh所有词频     — 列出所有已上传词频
+  khkh设置词频 [词频名] 来源=别名     — 设置来源（仅上传者）
+  khkh删除词频 [词频名]     — 删除词频（仅上传者）
+version: v1.1.0
 author: hertz
 repo: "https://github.com/hertz-hwang/astrbot_plugin_im_schemas"

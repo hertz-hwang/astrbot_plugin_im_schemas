@@ -237,6 +237,9 @@ def _render_text_with_fallback(draw, pos, text: str, fonts, fill, stroke_width: 
 DEFAULT_SELECT_KEYS = "_;'4567890"
 DEFAULT_MAX_LEN = 4
 
+# 单次词频查询允许的最大字词数，避免刷屏
+_FREQ_QUERY_MAX_WORDS = 100
+
 
 def _is_passthrough(ch: str) -> bool:
     """数字、字母、标点、空白等无需查码的字符（直接上屏，不算缺字）。"""
@@ -621,6 +624,10 @@ def _placeholders(n: int) -> str:
 _SCHEMA_NAMES_CACHE: set[str] = set()
 _SCHEMA_NAMES_CACHE_LOCK = threading.Lock()
 
+# 词频名缓存：与词提名共用同一命名空间（禁止重名），但各自独立存储
+_FREQ_NAMES_CACHE: set[str] = set()
+_FREQ_NAMES_CACHE_LOCK = threading.Lock()
+
 
 def _init_db(conn: sqlite3.Connection) -> None:
     # 写入 db 文件头的持久 PRAGMA：跨连接生效，但 auto_vacuum 切换需要一次 VACUUM 提交。
@@ -670,6 +677,25 @@ def _init_db(conn: sqlite3.Connection) -> None:
     # 反向索引：按 (schema, code) 查同码字词，用于计算选重位序
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_codes_by_code ON codes(schema_name, code)"
+    )
+
+    # ── 词频：与词提平行的一套轻量数据（字词 → 频率），不参与任何编码逻辑 ──
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS freqs (
+            name        TEXT PRIMARY KEY,
+            owner_id    TEXT NOT NULL,
+            owner_alias TEXT NOT NULL DEFAULT ''
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS freq_entries (
+            freq_name TEXT NOT NULL,
+            word      TEXT NOT NULL,
+            freq      TEXT NOT NULL
+        )
+    """)
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_freq_entries ON freq_entries(freq_name, word)"
     )
 
 
@@ -726,6 +752,7 @@ class IMSchemasPlugin(Star):
         super().__init__(context)
         self.config = config
         self._warm_schema_cache()
+        self._warm_freq_cache()
 
     def _warm_schema_cache(self) -> None:
         """启动时预热方案名缓存，避免后续重复查库。"""
@@ -736,6 +763,16 @@ class IMSchemasPlugin(Star):
                 _SCHEMA_NAMES_CACHE.update(r[0] for r in rows)
         except Exception as e:
             logger.warning(f"[im_schemas] 方案名缓存预热失败: {e}")
+
+    def _warm_freq_cache(self) -> None:
+        """启动时预热词频名缓存。"""
+        try:
+            with _open_db() as conn:
+                rows = conn.execute("SELECT name FROM freqs").fetchall()
+            with _FREQ_NAMES_CACHE_LOCK:
+                _FREQ_NAMES_CACHE.update(r[0] for r in rows)
+        except Exception as e:
+            logger.warning(f"[im_schemas] 词频名缓存预热失败: {e}")
 
     def _all_group_schemas(self) -> list[str]:
         """读取配置中的 all 组方案名列表，过滤掉空串和不存在的方案。"""
@@ -1230,6 +1267,129 @@ class IMSchemasPlugin(Star):
                 "chars": "".join(sorted(chars)),
             }
 
+    # ── 词频数据库操作 ──────────────────────────────────────────────────────
+    #
+    # 词频与词提共用命名空间（禁止重名），但数据、缓存、指令均独立。
+    # 词频只有「字词 → 频率」一层映射，不涉及编码 / 切分 / 选重等逻辑。
+
+    def _freq_exists(self, name: str) -> bool:
+        if name in _FREQ_NAMES_CACHE:
+            return True
+        with _open_db() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM freqs WHERE name = ?", (name,)
+            ).fetchone()
+            exists = row is not None
+            if exists:
+                with _FREQ_NAMES_CACHE_LOCK:
+                    _FREQ_NAMES_CACHE.add(name)
+            return exists
+
+    def _freq_owner(self, name: str) -> Optional[str]:
+        with _open_db() as conn:
+            row = conn.execute(
+                "SELECT owner_id FROM freqs WHERE name = ?", (name,)
+            ).fetchone()
+            return row[0] if row else None
+
+    def _count_user_freqs(self, owner_id: str) -> int:
+        with _open_db() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) FROM freqs WHERE owner_id = ?", (owner_id,)
+            ).fetchone()
+            return int(row[0]) if row else 0
+
+    def _import_freq(
+        self,
+        name: str,
+        owner_id: str,
+        entries: list[tuple[str, str]],
+    ) -> int:
+        """导入或刷新词频条目；同名词频只刷新 owner 与条目，保留 owner_alias。"""
+        with _open_db() as conn:
+            conn.execute(
+                """
+                INSERT INTO freqs(name, owner_id, owner_alias)
+                VALUES (?, ?, '')
+                ON CONFLICT(name) DO UPDATE SET
+                    owner_id = excluded.owner_id
+                """,
+                (name, owner_id),
+            )
+            conn.execute("DELETE FROM freq_entries WHERE freq_name = ?", (name,))
+            conn.executemany(
+                "INSERT INTO freq_entries(freq_name, word, freq) VALUES (?, ?, ?)",
+                [(name, word, freq) for word, freq in entries],
+            )
+            conn.commit()
+            count = conn.execute(
+                "SELECT COUNT(*) FROM freq_entries WHERE freq_name = ?", (name,)
+            ).fetchone()[0]
+            conn.execute("PRAGMA incremental_vacuum")
+        with _FREQ_NAMES_CACHE_LOCK:
+            _FREQ_NAMES_CACHE.add(name)
+        return count
+
+    def _delete_freq(self, name: str) -> None:
+        with _open_db() as conn:
+            conn.execute("DELETE FROM freq_entries WHERE freq_name = ?", (name,))
+            conn.execute("DELETE FROM freqs WHERE name = ?", (name,))
+            conn.commit()
+            conn.execute("PRAGMA incremental_vacuum")
+        with _FREQ_NAMES_CACHE_LOCK:
+            _FREQ_NAMES_CACHE.discard(name)
+
+    def _update_freq_alias(self, name: str, alias: str) -> None:
+        with _open_db() as conn:
+            conn.execute(
+                "UPDATE freqs SET owner_alias = ? WHERE name = ?", (alias, name)
+            )
+            conn.commit()
+
+    def _list_all_freqs(self) -> list[tuple[str, str, str]]:
+        """返回所有词频的 (name, owner_id, owner_alias) 列表，按 name 字典序。"""
+        with _open_db() as conn:
+            rows = conn.execute(
+                "SELECT name, owner_id, owner_alias FROM freqs ORDER BY name"
+            ).fetchall()
+            return [(r[0], r[1], r[2]) for r in rows]
+
+    def _freq_info(self, name: str) -> Optional[dict]:
+        with _open_db() as conn:
+            row = conn.execute(
+                "SELECT owner_id, owner_alias FROM freqs WHERE name = ?", (name,)
+            ).fetchone()
+            if not row:
+                return None
+            count = conn.execute(
+                "SELECT COUNT(*) FROM freq_entries WHERE freq_name = ?", (name,)
+            ).fetchone()[0]
+            return {
+                "owner_id": row[0],
+                "owner_alias": row[1],
+                "count": int(count),
+            }
+
+    def _query_freqs(self, name: str, words: list[str]) -> dict[str, str]:
+        """批量查询字词的频率，返回 {word: freq}；未收录的词不出现在结果中。"""
+        unique_words = list({w for w in words if w})
+        if not unique_words:
+            return {}
+        out: dict[str, str] = {}
+        CHUNK = 100
+        with _open_db() as conn:
+            for i in range(0, len(unique_words), CHUNK):
+                batch = unique_words[i:i + CHUNK]
+                rows = conn.execute(
+                    "SELECT word, freq FROM freq_entries "
+                    f"WHERE freq_name = ? AND word IN ({_placeholders(len(batch))})",
+                    (name, *batch),
+                ).fetchall()
+                for word, freq in rows:
+                    # 同词多行时保留首次出现的值
+                    out.setdefault(word, freq)
+        return out
+
     # ── 解析 TSV 码表 ───────────────────────────────────────────────────────
 
     @staticmethod
@@ -1256,6 +1416,30 @@ class IMSchemasPlugin(Star):
                 word = parts[i].strip()
                 if word:
                     entries.append((code, word))
+        return entries
+
+    @staticmethod
+    def _parse_freq_tsv(content: str) -> list[tuple[str, str]]:
+        """解析词频文件，格式为「字词<TAB>词频」，返回 [(word, freq), ...]。
+
+        注意列序与码表相反：第一列是字词，第二列是词频。
+        多余的列会被忽略；同一字词重复出现时保留首次的值。
+        """
+        entries: list[tuple[str, str]] = []
+        seen: set[str] = set()
+        for raw in content.splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split("\t")
+            if len(parts) < 2:
+                continue
+            word = parts[0].strip()
+            freq = parts[1].strip()
+            if not word or not freq or word in seen:
+                continue
+            seen.add(word)
+            entries.append((word, freq))
         return entries
 
     # ── 文件下载 ────────────────────────────────────────────────────────────
@@ -2603,6 +2787,9 @@ class IMSchemasPlugin(Star):
                 "文件已收到。请引用回复上方文件消息，并发送：\n"
                 "khkh上传词提 [词提名]\n\n"
                 "示例：khkh上传词提 五笔86\n\n"
+                "若该文件为词频表（每行「字词<TAB>词频」），请改为发送：\n"
+                "khkh上传词频 [词频名]\n"
+                "示例：khkh上传词频 常用词频\n\n"
                 "首次上传后，可单独设置以下参数（不会被后续重新上传重置）：\n"
                 "  khkh设置词提 [词提名] 来源=[别名]\n"
                 "  khkh设置词提 [词提名] 选重键=_;'4567890\n"
@@ -2642,6 +2829,12 @@ class IMSchemasPlugin(Star):
         schema_name = tokens[0]
         if len(schema_name) <= 1:
             yield event.plain_result("词提名不能为单个字符，请使用至少两个字符的名称。")
+            return
+        if self._freq_exists(schema_name):
+            yield event.plain_result(
+                f"名称「{schema_name}」已被词频占用，请换一个名称"
+                f"（或先用「khkh删除词频 {schema_name}」删除该词频）。"
+            )
             return
 
         # 从引用回复中找 File
@@ -2738,6 +2931,140 @@ class IMSchemasPlugin(Star):
             f"如需使用自定义字体，请联系：荒 1121144145"
         )
 
+    # ── 上传词频 ────────────────────────────────────────────────────────────
+
+    @filter.command("上传词频")
+    async def cmd_upload_freq(self, event: AstrMessageEvent):
+        """
+        用法：引用回复词频文件消息，发送
+          khkh上传词频 [词频名]
+
+        词频文件为 TSV：每行「字词<TAB>词频」。
+        """
+        usage = "用法：khkh上传词频 [词频名]"
+        args_str = event.message_str.strip()
+        if not args_str:
+            yield event.plain_result(usage)
+            return
+
+        tokens = args_str.split()
+        if tokens and tokens[0] == "上传词频":
+            tokens = tokens[1:]
+        if not tokens:
+            yield event.plain_result(usage)
+            return
+        if len(tokens) > 1:
+            yield event.plain_result("上传词频仅接受词频名一个参数。")
+            return
+        freq_name = tokens[0]
+        if len(freq_name) <= 1:
+            yield event.plain_result("词频名不能为单个字符，请使用至少两个字符的名称。")
+            return
+        if self._schema_exists(freq_name):
+            yield event.plain_result(
+                f"名称「{freq_name}」已被词提占用，请换一个名称"
+                f"（词频与词提共用同一套名称）。"
+            )
+            return
+        if self._is_all_trigger(freq_name):
+            yield event.plain_result(
+                f"名称「{freq_name}」与 all 组触发词冲突，请换一个名称。"
+            )
+            return
+
+        # 从引用回复中找 File
+        chain = event.get_messages()
+        reply_seg: Optional[Reply] = next(
+            (seg for seg in chain if seg.type == ComponentType.Reply), None
+        )
+
+        file_seg: Optional[File] = None
+        if reply_seg and reply_seg.chain:
+            file_seg = next(
+                (seg for seg in reply_seg.chain if seg.type == ComponentType.File),
+                None,
+            )
+
+        if file_seg is None:
+            yield event.plain_result(
+                "未找到词频文件。请引用回复您上传的 .txt 文件消息，再发送此指令。"
+            )
+            return
+
+        url = file_seg.url
+        if not url:
+            yield event.plain_result("无法获取文件下载链接，请重新发送文件后重试。")
+            return
+
+        user_id = event.get_sender_id()
+        is_admin = event.is_admin()
+
+        file_size = getattr(file_seg, "size", None)
+        if file_size is not None and not is_admin:
+            max_size_mb = 100
+            max_size_bytes = max_size_mb * 1024 * 1024
+            if file_size > max_size_bytes:
+                size_mb = file_size / (1024 * 1024)
+                yield event.plain_result(
+                    f"文件过大！用户上传文件限制在 {max_size_mb}MB 以内，"
+                    f"当前文件大小为 {size_mb:.2f}MB。\n"
+                    f"如果需要，请联系管理员上传：荒 1121144145。"
+                )
+                return
+
+        yield event.plain_result("正在下载并解析词频，请稍候…")
+
+        try:
+            content = await self._download_text(url)
+        except _UrlExpiredError as e:
+            logger.warning(f"[im_schemas] 文件 URL 已失效: {e}")
+            yield event.plain_result(
+                "文件链接已失效，请重新上传文件后再引用此消息。"
+            )
+            return
+        except _EncodingError as e:
+            logger.warning(f"[im_schemas] 无法识别文件编码: {e}")
+            yield event.plain_result(
+                "无法识别文件编码。请确认文件为 utf-8 / gbk / gb18030 / big5 / utf-16 中的一种，"
+                "转换后重新上传。"
+            )
+            return
+        except _NetworkError as e:
+            logger.warning(f"[im_schemas] 下载文件失败: {e}")
+            yield event.plain_result("文件下载失败，请检查网络后重试。")
+            return
+
+        entries = self._parse_freq_tsv(content)
+        if not entries:
+            yield event.plain_result(
+                "未能解析出有效条目。请确认文件为 TSV 格式：\n"
+                "第一列字词，第二列词频，Tab 分隔。\n"
+                "例如：的<TAB>1234567\n"
+            )
+            return
+
+        if not is_admin:
+            existing_owner = self._freq_owner(freq_name)
+            if existing_owner is not None and existing_owner != user_id:
+                yield event.plain_result(f"词频「{freq_name}」已存在且不属于你，无法覆盖。")
+                return
+            try:
+                limit = int(self.config.get("member_max_freqs", 3))
+            except (TypeError, ValueError):
+                limit = 3
+            if limit > 0 and existing_owner is None and self._count_user_freqs(user_id) >= limit:
+                yield event.plain_result(
+                    f"你已上传 {limit} 个词频，达到上限。请先使用「khkh删除词频 [词频名]」删除已有词频后再上传新的。"
+                )
+                return
+
+        count = self._import_freq(freq_name, user_id, entries)
+        yield event.plain_result(
+            f"词频「{freq_name}」导入成功！共 {count:,} 条。\n"
+            f"查询：{freq_name} <字词1> [<字词2> ...]\n"
+            f"信息：%{freq_name}"
+        )
+
     # ── 查码：[词提名] <字词>，或引用回复+[词提名] ─────────────────────────
 
     @staticmethod
@@ -2781,6 +3108,30 @@ class IMSchemasPlugin(Star):
             return
         head, rest = m.group(1), m.group(2)
         if head.startswith("%"):
+            return
+
+        # 词频查询：[词频名] <字词1> [<字词2> ...]
+        # 词频名与词提名禁止重名，故这里命中时不会与下方任何查码分支冲突。
+        if self._freq_exists(head):
+            words = rest.split() if rest else []
+            if not words:
+                yield event.plain_result(f"用法：{head} <字词1> [<字词2> ...]")
+                return
+            uniq = list(dict.fromkeys(words))
+            truncated = len(uniq) > _FREQ_QUERY_MAX_WORDS
+            if truncated:
+                uniq = uniq[:_FREQ_QUERY_MAX_WORDS]
+            try:
+                found = self._query_freqs(head, uniq)
+            except Exception as e:
+                logger.exception(f"[im_schemas] 查询词频失败: {e}")
+                yield event.plain_result(f"查询词频「{head}」时出错。")
+                return
+            lines = [f"{w} → {found.get(w, '未收录')}" for w in uniq]
+            body = f"【{head}】\n" + "\n".join(lines)
+            if truncated:
+                body += f"\n（一次最多查询 {_FREQ_QUERY_MAX_WORDS} 个字词，其余已省略）"
+            yield event.plain_result(body)
             return
 
         # 快速过滤：head 必须是已知词提名或 all 触发词，否则不处理
@@ -2979,7 +3330,16 @@ class IMSchemasPlugin(Star):
         schema_name = m.group(1)
         info = self._schema_info(schema_name)
         if not info:
-            yield event.plain_result(f"词提「{schema_name}」不存在。")
+            finfo = self._freq_info(schema_name)
+            if finfo:
+                yield event.plain_result(
+                    f"词频：{schema_name}\n"
+                    f"来源：{self._display_owner(finfo['owner_id'], finfo['owner_alias'])}\n"
+                    f"条目数：{finfo['count']:,}\n"
+                    f"查询：{schema_name} <字词1> [<字词2> ...]"
+                )
+                return
+            yield event.plain_result(f"词提 / 词频「{schema_name}」不存在。")
             return
         yield event.plain_result(
             f"词提：{schema_name}\n"
@@ -3124,3 +3484,92 @@ class IMSchemasPlugin(Star):
             return
         self._delete_schema(schema_name)
         yield event.plain_result(f"词提「{schema_name}」已删除。")
+
+    # ── 所有词频 ────────────────────────────────────────────────────────────
+
+    @filter.command("所有词频")
+    async def cmd_list_all_freqs(self, event: AstrMessageEvent):
+        """
+        用法：查询服务器中所有的词频，发送
+          khkh所有词频
+        """
+        freqs = self._list_all_freqs()
+        if not freqs:
+            yield event.plain_result("暂无词频。")
+            return
+        owner_count = len({owner for _, owner, _ in freqs})
+        lines = [
+            f"{name}（来源：{self._display_owner(owner, alias)}，UP：{owner}）"
+            for name, owner, alias in freqs
+        ]
+        yield event.plain_result(
+            f"共 {len(freqs)} 个词频，来自 {owner_count} 个来源\n" + "\n".join(lines)
+        )
+
+    # ── 设置词频 ────────────────────────────────────────────────────────────
+
+    @filter.command("设置词频")
+    async def cmd_settings_freq(self, event: AstrMessageEvent):
+        """
+        用法：khkh设置词频 [词频名] 来源=别名
+        """
+        usage = "用法：khkh设置词频 [词频名] 来源=别名"
+        args_str = event.message_str.strip()
+        if args_str.startswith("设置词频"):
+            args_str = args_str[len("设置词频"):].strip()
+        if not args_str:
+            yield event.plain_result(usage)
+            return
+
+        tokens = args_str.split(maxsplit=1)
+        if len(tokens) < 2:
+            yield event.plain_result(usage)
+            return
+        freq_name, kv = tokens[0], tokens[1].strip()
+
+        if "=" not in kv:
+            yield event.plain_result(usage)
+            return
+        key, value = kv.split("=", 1)
+        key = key.strip()
+
+        owner = self._freq_owner(freq_name)
+        if owner is None:
+            yield event.plain_result(f"词频「{freq_name}」不存在。")
+            return
+        user_id = event.get_sender_id()
+        if owner != user_id and not event.is_admin():
+            yield event.plain_result(f"只有词频「{freq_name}」的上传者才能修改它。")
+            return
+
+        if key == "来源":
+            self._update_freq_alias(freq_name, value)
+            shown = value if value else "（无）"
+            yield event.plain_result(f"词频「{freq_name}」来源别名已更新为：{shown}")
+        else:
+            yield event.plain_result(f"未知设置项「{key}」。\n{usage}")
+
+    # ── 删除词频 ────────────────────────────────────────────────────────────
+
+    @filter.command("删除词频")
+    async def cmd_delete_freq(self, event: AstrMessageEvent):
+        """
+        用法：删除某个词频，发送
+          khkh删除词频 [词频名]
+        """
+        freq_name = event.message_str.strip()
+        if freq_name.startswith("删除词频"):
+            freq_name = freq_name[len("删除词频"):].strip()
+        if not freq_name:
+            yield event.plain_result("用法：khkh删除词频 [词频名]")
+            return
+        owner = self._freq_owner(freq_name)
+        if owner is None:
+            yield event.plain_result(f"词频「{freq_name}」不存在。")
+            return
+        user_id = event.get_sender_id()
+        if owner != user_id and not event.is_admin():
+            yield event.plain_result(f"只有词频「{freq_name}」的上传者才能删除它。")
+            return
+        self._delete_freq(freq_name)
+        yield event.plain_result(f"词频「{freq_name}」已删除。")
