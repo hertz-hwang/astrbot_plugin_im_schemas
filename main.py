@@ -3219,15 +3219,28 @@ class IMSchemasPlugin(Star):
                 yield event.plain_result(f"查询词频「{head}」时出错。")
                 return
             # 按查询到的词频降序排列；未收录项统一放在末尾，频率相同则保持用户查询顺序。
+            # 词频列里偶尔会出现 "1094496／19222872" 这类含分隔符的复合写法，
+            # 这里的分隔符不固定（／、/、|、空格 等都可能），所以兜底取最后一个
+            # 连续数字段（允许千分位逗号）作为排序依据；解析失败的项统一沉底。
+            _freq_num_re = re.compile(r"[\d,]+")
+
             def _freq_sort_key(word: str) -> tuple[int, float]:
                 value = found.get(word)
                 if value is None:
                     return (1, 0)
+                # 1) 优先按整段当作纯数字解析，保留旧行为。
                 try:
                     return (0, -float(value.replace(",", "")))
                 except (ValueError, TypeError):
-                    # 非数值词频无法参与数值排序，但仍排在已解析的数值之后。
-                    return (0, float("inf"))
+                    pass
+                # 2) 取最后一个连续数字段（允许带千分位逗号）。
+                for chunk in reversed(_freq_num_re.findall(value)):
+                    try:
+                        return (0, -float(chunk.replace(",", "")))
+                    except ValueError:
+                        continue
+                # 3) 实在解析不出任何数字，排在所有数值之后。
+                return (0, float("inf"))
 
             ordered_words = sorted(uniq, key=_freq_sort_key)
             lines = [f"{w} → {found.get(w, '未收录')}" for w in ordered_words]
