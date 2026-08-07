@@ -218,6 +218,23 @@ khkh删除词频 [词频名]            # 仅上传者可删
 | `single_char_prefix` | 强制单字查询引导键（支持正则，留空禁用） | `!` |
 | `member_max_schemas` | 非管理员可上传词提上限（≤0 表示不限） | `3` |
 | `member_max_freqs` | 非管理员可上传词频上限（≤0 表示不限） | `3` |
+| `plugin_admins` | 插件管理员 user_id 列表（与系统管理员享有同等权限） | `[]` |
+
+### 关于权限
+
+本插件中“管理员”的判定规则如下，满足**任一条件**即视为管理员：
+
+1. AstrBot 系统级管理员（`event.is_admin()` 为真）；
+2. 发送者 `user_id` 出现在插件配置的 `plugin_admins` 列表中。
+
+通过 `plugin_admins` 字段，系统管理员可以在 AstrBot 插件管理页中维护一份与本插件相关的独立名单，无需将用户提升为 AstrBot 全局管理员。插件管理员享有：
+
+- 跳过 `member_max_schemas` / `member_max_freqs` 上传数量上限；
+- 跳过 `MAX_UPLOAD_MB` 单文件大小限制；
+- 可使用任意长度的词提 / 词频名（含单字符）；
+- 可修改 / 删除他人上传的词提与词频（包括设置 `PUA` 自定义字体）。
+
+修改 `plugin_admins` 后无需重启插件，下次请求即生效。
 
 ## 项目结构
 

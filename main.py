@@ -792,6 +792,26 @@ class IMSchemasPlugin(Star):
         except re.error:
             return name == pat
 
+    def _is_admin(self, event: AstrMessageEvent) -> bool:
+        """判断事件发送者是否享有插件管理员权限。
+        满足任一条件即视为管理员：
+        1. AstrBot 系统级管理员（event.is_admin() 为真）；
+        2. 发送者 user_id 出现在插件配置 `plugin_admins` 列表中。
+
+        这样系统管理员可以在 AstrBot 插件页中维护一份独立的插件管理员名单，
+        而不必动用 AstrBot 全局管理员权限。"""
+        if event.is_admin():
+            return True
+        try:
+            admins = self.config.get("plugin_admins", []) or []
+        except (TypeError, ValueError):
+            admins = []
+        if not admins:
+            return False
+        sender_id = event.get_sender_id()
+        # 配置项在 AstrBot 端允许 str/int 混合输入，统一转 str 后比较
+        return str(sender_id) in {str(a).strip() for a in admins if str(a).strip()}
+
     # ── 数据库操作 ──────────────────────────────────────────────────────────
 
     def _schema_exists(self, name: str) -> bool:
@@ -2878,7 +2898,7 @@ class IMSchemasPlugin(Star):
             )
             return
         schema_name = tokens[0]
-        if len(schema_name) <= 1 and not event.is_admin():
+        if len(schema_name) <= 1 and not self._is_admin(event):
             yield event.plain_result("词提名不能为单个字符，请使用至少两个字符的名称。")
             return
         if self._freq_exists(schema_name):
@@ -2913,7 +2933,7 @@ class IMSchemasPlugin(Star):
             return
 
         user_id = event.get_sender_id()
-        is_admin = event.is_admin()
+        is_admin = self._is_admin(event)
 
         file_size = getattr(file_seg, "size", None)
         if file_size is None:
@@ -3018,7 +3038,7 @@ class IMSchemasPlugin(Star):
             yield event.plain_result("上传词频仅接受词频名一个参数。")
             return
         freq_name = tokens[0]
-        if len(freq_name) <= 1 and not event.is_admin():
+        if len(freq_name) <= 1 and not self._is_admin(event):
             yield event.plain_result("词频名不能为单个字符，请使用至少两个字符的名称。")
             return
         if self._schema_exists(freq_name):
@@ -3058,7 +3078,7 @@ class IMSchemasPlugin(Star):
             return
 
         user_id = event.get_sender_id()
-        is_admin = event.is_admin()
+        is_admin = self._is_admin(event)
 
         file_size = getattr(file_seg, "size", None)
         if file_size is None:
@@ -3494,7 +3514,7 @@ class IMSchemasPlugin(Star):
             yield event.plain_result(f"词提「{schema_name}」不存在。")
             return
         user_id = event.get_sender_id()
-        if owner != user_id and not event.is_admin():
+        if owner != user_id and not self._is_admin(event):
             yield event.plain_result(f"只有词提「{schema_name}」的上传者才能修改它。")
             return
 
@@ -3521,7 +3541,7 @@ class IMSchemasPlugin(Star):
             shown = value if value else "（无）"
             yield event.plain_result(f"词提「{schema_name}」来源别名已更新为：{shown}")
         elif key == "PUA":
-            if not event.is_admin():
+            if not self._is_admin(event):
                 yield event.plain_result("只有管理员才能设置自定义字体。")
                 return
             if not value:
@@ -3562,7 +3582,7 @@ class IMSchemasPlugin(Star):
             yield event.plain_result(f"词提「{schema_name}」不存在。")
             return
         user_id = event.get_sender_id()
-        if owner != user_id and not event.is_admin():
+        if owner != user_id and not self._is_admin(event):
             yield event.plain_result(f"只有词提「{schema_name}」的上传者才能删除它。")
             return
         self._delete_schema(schema_name)
@@ -3621,7 +3641,7 @@ class IMSchemasPlugin(Star):
             yield event.plain_result(f"词频「{freq_name}」不存在。")
             return
         user_id = event.get_sender_id()
-        if owner != user_id and not event.is_admin():
+        if owner != user_id and not self._is_admin(event):
             yield event.plain_result(f"只有词频「{freq_name}」的上传者才能修改它。")
             return
 
@@ -3651,7 +3671,7 @@ class IMSchemasPlugin(Star):
             yield event.plain_result(f"词频「{freq_name}」不存在。")
             return
         user_id = event.get_sender_id()
-        if owner != user_id and not event.is_admin():
+        if owner != user_id and not self._is_admin(event):
             yield event.plain_result(f"只有词频「{freq_name}」的上传者才能删除它。")
             return
         self._delete_freq(freq_name)
