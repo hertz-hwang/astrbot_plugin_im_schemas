@@ -1662,11 +1662,22 @@ class IMSchemasPlugin(Star):
 
     @staticmethod
     def _to_png_bytes(img: Image.Image, decorate: bool = True) -> bytes:
-        """统一出口：可选地套上装饰边框，再编码为 PNG 字节。"""
+        """统一出口：可选地套上装饰边框，再编码为 WebP 无损字节。
+
+        函数名沿用 ``_to_png_bytes`` 以避免大幅改动调用点，但实际输出 WebP。
+        选用 WebP 无损的原因：
+          * 体积通常比同画质 PNG 小 25~40%，解决 QQ 端图片过大的问题；
+          * ``lossless=True`` + ``exact=True`` 保证像素与原图完全一致，
+            对文字/键位等锐利边缘不会有任何可见损失；
+          * ``method=6`` 是 libwebp 最慢但压缩率最高的编码模式，
+            CPU 多花几十毫秒，对插件交互完全可接受。
+        下游兼容：AstrImage.fromBytes 仅做 base64 透传，QQ 官方机器人与
+        NapCat/go-cqhttp 均按字节嗅探格式，QQ 客户端原生支持 WebP。
+        """
         if decorate:
             img = IMSchemasPlugin._decorate(img)
         buf = BytesIO()
-        img.save(buf, format="PNG")
+        img.save(buf, format="WEBP", lossless=True, method=6, exact=True)
         return buf.getvalue()
 
     @staticmethod
